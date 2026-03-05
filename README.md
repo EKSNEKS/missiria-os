@@ -109,8 +109,11 @@ Behavior:
   - `wp plugin update --all`
   - `wp theme update --all`
   - WP language update commands
+- Prints discovered `domain -> root -> wordpress` details before update pass
 - Runs updates as `www-data`
-- If `wp` is not installed, update phase is skipped with a warning.
+- If `wp` is not installed, script attempts temporary `wp-cli.phar` usage (`php /tmp/wp-cli.phar`).
+- In `all` mode, update phase is skipped if WP-CLI cannot be resolved.
+- In `updates` mode, script exits with error if updates cannot run.
 - Uses memory-safe default:
   - `WP_CLI_PHP_ARGS="-d memory_limit=256M"` (override supported)
 
