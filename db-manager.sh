@@ -293,322 +293,29 @@ global_search_replace() {
     log "Total updated rows: $total_rows"
 }
 
-validate_wp_prefix() {
-    local prefix="$1"
-    [[ "$prefix" =~ ^[A-Za-z0-9_]+$ ]]
-}
+launch_wp_manager() {
+    local script_dir wp_script
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    wp_script="${script_dir}/wp-manager.sh"
 
-wp_table_exists() {
-    local db_name="$1"
-    local table_name="$2"
-    local db_escaped table_escaped found
-    db_escaped="$(sql_escape_literal "$db_name")"
-    table_escaped="$(sql_escape_literal "$table_name")"
-    found="$(
-        mysql_exec -N -s -e "
-            SELECT TABLE_NAME
-            FROM information_schema.TABLES
-            WHERE TABLE_SCHEMA='${db_escaped}'
-              AND TABLE_NAME='${table_escaped}'
-            LIMIT 1;
-        " 2>/dev/null || true
-    )"
-    [[ -n "$found" ]]
-}
-
-get_wp_context() {
-    local db_name prefix
-    read -r -p "Enter the WordPress database name: " db_name
-    [[ -z "$db_name" ]] && {
-        error "Database name is required."
-        return 1
-    }
-    require_database "$db_name" || return 1
-
-    read -r -p "Enter the WordPress table prefix (e.g., wp_): " prefix
-    [[ -z "$prefix" ]] && {
-        error "Table prefix is required."
-        return 1
-    }
-    if ! validate_wp_prefix "$prefix"; then
-        error "Invalid prefix '$prefix'. Allowed chars: letters, numbers, underscore."
+    if [[ ! -f "$wp_script" ]]; then
+        error "WordPress manager not found: $wp_script"
         return 1
     fi
 
-    WP_DB_NAME="$db_name"
-    WP_PREFIX="$prefix"
-    return 0
-}
-
-require_wp_core_tables() {
-    local db_name="$1"
-    local prefix="$2"
-    local -a required=("options" "posts" "postmeta")
-    local -a missing=()
-    local suffix table_name
-
-    for suffix in "${required[@]}"; do
-        table_name="${prefix}${suffix}"
-        if ! wp_table_exists "$db_name" "$table_name"; then
-            missing+=("$table_name")
-        fi
-    done
-
-    if ((${#missing[@]} > 0)); then
-        error "Missing required WordPress table(s): ${missing[*]}"
-        return 1
+    if [[ -x "$wp_script" ]]; then
+        DB_USER="$DB_USER" \
+        MYSQL_BIN="$MYSQL_BIN" \
+        MYSQLDUMP_BIN="$MYSQLDUMP_BIN" \
+        DEFAULT_BACKUP_DIR="$DEFAULT_BACKUP_DIR" \
+        "$wp_script"
+    else
+        DB_USER="$DB_USER" \
+        MYSQL_BIN="$MYSQL_BIN" \
+        MYSQLDUMP_BIN="$MYSQLDUMP_BIN" \
+        DEFAULT_BACKUP_DIR="$DEFAULT_BACKUP_DIR" \
+        bash "$wp_script"
     fi
-}
-
-wp_domain_migration() {
-    local old_domain new_domain old_escaped new_escaped
-    get_wp_context || return
-    require_wp_core_tables "$WP_DB_NAME" "$WP_PREFIX" || return
-
-    read -r -p "Enter OLD domain (e.g., https://old.com): " old_domain
-    read -r -p "Enter NEW domain (e.g., https://new.com): " new_domain
-
-    [[ -z "$old_domain" || -z "$new_domain" ]] && {
-        error "Domains cannot be empty."
-        return
-    }
-
-    if confirm "Create a backup before WordPress migration?"; then
-        backup_database "$WP_DB_NAME" || return
-    fi
-
-    confirm "Proceed with domain migration in WordPress tables?" || {
-        log "Aborted."
-        return
-    }
-
-    old_escaped="$(sql_escape_literal "$old_domain")"
-    new_escaped="$(sql_escape_literal "$new_domain")"
-
-    local options_table posts_table postmeta_table
-    options_table="$(quote_identifier "${WP_PREFIX}options")"
-    posts_table="$(quote_identifier "${WP_PREFIX}posts")"
-    postmeta_table="$(quote_identifier "${WP_PREFIX}postmeta")"
-
-    local options_rows guid_rows content_rows meta_rows
-    options_rows="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            UPDATE ${options_table}
-            SET option_value = REPLACE(option_value, '${old_escaped}', '${new_escaped}')
-            WHERE option_name IN ('home', 'siteurl')
-              AND INSTR(option_value, '${old_escaped}') > 0;
-            SELECT ROW_COUNT();
-        " | tail -n1
-    )"
-
-    guid_rows="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            UPDATE ${posts_table}
-            SET guid = REPLACE(guid, '${old_escaped}', '${new_escaped}')
-            WHERE INSTR(guid, '${old_escaped}') > 0;
-            SELECT ROW_COUNT();
-        " | tail -n1
-    )"
-
-    content_rows="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            UPDATE ${posts_table}
-            SET post_content = REPLACE(post_content, '${old_escaped}', '${new_escaped}')
-            WHERE INSTR(post_content, '${old_escaped}') > 0;
-            SELECT ROW_COUNT();
-        " | tail -n1
-    )"
-
-    meta_rows="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            UPDATE ${postmeta_table}
-            SET meta_value = REPLACE(meta_value, '${old_escaped}', '${new_escaped}')
-            WHERE meta_value NOT LIKE 'a:%'
-              AND meta_value NOT LIKE 'O:%'
-              AND INSTR(meta_value, '${old_escaped}') > 0;
-            SELECT ROW_COUNT();
-        " | tail -n1
-    )"
-
-    log "WordPress migration completed."
-    log " - options (home/siteurl): ${options_rows:-0} row(s)"
-    log " - posts.guid: ${guid_rows:-0} row(s)"
-    log " - posts.post_content: ${content_rows:-0} row(s)"
-    log " - postmeta.meta_value (non-serialized only): ${meta_rows:-0} row(s)"
-}
-
-wp_replace_post_content() {
-    local search_text replace_text search_escaped replace_escaped
-    get_wp_context || return
-    if ! wp_table_exists "$WP_DB_NAME" "${WP_PREFIX}posts"; then
-        error "Missing posts table: ${WP_PREFIX}posts"
-        return
-    fi
-
-    read -r -p "Find in post_content: " search_text
-    [[ -z "$search_text" ]] && {
-        error "Search text cannot be empty."
-        return
-    }
-    read -r -p "Replace with: " replace_text
-
-    if confirm "Create a backup before replacing post_content?"; then
-        backup_database "$WP_DB_NAME" || return
-    fi
-
-    confirm "Proceed with post_content replacement?" || {
-        log "Aborted."
-        return
-    }
-
-    search_escaped="$(sql_escape_literal "$search_text")"
-    replace_escaped="$(sql_escape_literal "$replace_text")"
-
-    local posts_table changed_rows
-    posts_table="$(quote_identifier "${WP_PREFIX}posts")"
-    changed_rows="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            UPDATE ${posts_table}
-            SET post_content = REPLACE(post_content, '${search_escaped}', '${replace_escaped}')
-            WHERE INSTR(post_content, '${search_escaped}') > 0;
-            SELECT ROW_COUNT();
-        " | tail -n1
-    )"
-
-    log "post_content replacement completed: ${changed_rows:-0} row(s) updated."
-}
-
-wp_remove_param_in_post_content() {
-    local raw_param param_to_remove param_escaped
-    get_wp_context || return
-    if ! wp_table_exists "$WP_DB_NAME" "${WP_PREFIX}posts"; then
-        error "Missing posts table: ${WP_PREFIX}posts"
-        return
-    fi
-
-    read -r -p "Query parameter to remove [utm_source=chatgpt.com]: " raw_param
-    raw_param="${raw_param:-utm_source=chatgpt.com}"
-    raw_param="${raw_param#\?}"
-    raw_param="${raw_param#&}"
-    param_to_remove="$raw_param"
-
-    [[ -z "$param_to_remove" ]] && {
-        error "Parameter cannot be empty."
-        return
-    }
-
-    if confirm "Create a backup before URL parameter cleanup?"; then
-        backup_database "$WP_DB_NAME" || return
-    fi
-
-    confirm "Proceed with post_content link cleanup for '${param_to_remove}'?" || {
-        log "Aborted."
-        return
-    }
-
-    local posts_table before_count after_count
-    posts_table="$(quote_identifier "${WP_PREFIX}posts")"
-    param_escaped="$(sql_escape_literal "$param_to_remove")"
-
-    before_count="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            SELECT COUNT(*)
-            FROM ${posts_table}
-            WHERE INSTR(post_content, '${param_escaped}') > 0;
-        " | tail -n1
-    )"
-
-    mysql_exec_db "$WP_DB_NAME" -e "
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('?', '${param_escaped}', '&'), '?')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&', '${param_escaped}', '&'), '&')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('?', '${param_escaped}', '\"'), '\"')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&', '${param_escaped}', '\"'), '\"')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('?', '${param_escaped}', CHAR(39)), CHAR(39))
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&', '${param_escaped}', CHAR(39)), CHAR(39))
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('?', '${param_escaped}', '&amp;'), '?')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&', '${param_escaped}', '&amp;'), '&amp;')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&amp;', '${param_escaped}', '&amp;'), '&amp;')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&amp;', '${param_escaped}', '\"'), '\"')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&amp;', '${param_escaped}', CHAR(39)), CHAR(39))
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('?', '${param_escaped}'), '')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&', '${param_escaped}'), '')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-
-        UPDATE ${posts_table}
-        SET post_content = REPLACE(post_content, CONCAT('&amp;', '${param_escaped}'), '')
-        WHERE INSTR(post_content, '${param_escaped}') > 0;
-    "
-
-    after_count="$(
-        mysql_exec_db "$WP_DB_NAME" -N -s -e "
-            SELECT COUNT(*)
-            FROM ${posts_table}
-            WHERE INSTR(post_content, '${param_escaped}') > 0;
-        " | tail -n1
-    )"
-
-    log "WordPress post_content query cleanup completed."
-    log " - Rows containing '${param_to_remove}' before: ${before_count:-0}"
-    log " - Rows containing '${param_to_remove}' after : ${after_count:-0}"
-    log "Trailing quote patterns are handled for both single and double quotes."
-}
-
-wordpress_batch_menu() {
-    local choice
-    while true; do
-        log ""
-        log "--- WORDPRESS BATCH SHELL ---"
-        log "1) Domain migration (siteurl, home, guid, content, postmeta)"
-        log "2) Search & replace in post_content only"
-        log "3) Remove query parameter from post_content links"
-        log "4) Back to main menu"
-        read -r -p "Choice [1-4]: " choice
-
-        case "$choice" in
-            1) wp_domain_migration ;;
-            2) wp_replace_post_content ;;
-            3) wp_remove_param_in_post_content ;;
-            4) return ;;
-            *) error "Invalid WordPress batch option." ;;
-        esac
-    done
 }
 
 mass_file_renamer() {
@@ -711,7 +418,7 @@ show_main_menu() {
     log "1) CLEANUP Tables inside a database (Prefix or Plugins)"
     log "2) DROP an entire database"
     log "3) SEARCH & REPLACE text across ALL tables (Global)"
-    log "4) WORDPRESS BATCH SHELL (migration, post_content tools)"
+    log "4) LAUNCH WORDPRESS MANAGER (wp-manager.sh)"
     log "5) RENAME Physical Files in a Directory (e.g., Media Uploads)"
     log "6) EXPORT a Database (Quick Select by Number)"
     log "7) EXIT"
@@ -727,7 +434,7 @@ main() {
             1) cleanup_tables ;;
             2) drop_database ;;
             3) global_search_replace ;;
-            4) wordpress_batch_menu ;;
+            4) launch_wp_manager ;;
             5) mass_file_renamer ;;
             6) export_database ;;
             7)
