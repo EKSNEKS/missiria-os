@@ -17,7 +17,7 @@ All scripts include a consistent CLI header/UI and are intended for Linux server
 |---|---|---|---|
 | `db-manager.sh` | Generic DB operations (cleanup, drop, global replace, export, file rename, WP manager launcher) | Yes | `root`/DB admin |
 | `wp-manager.sh` | WordPress-focused DB operations (migration, content cleanup, maintenance bundle) | Yes | `root`/DB admin |
-| `wp-cron-master.sh` | Trigger `wp-cron.php` and/or force WP updates via WP-CLI in memory-safe mode | No (argument driven) | `root`/sudo |
+| `wp-cron-master.sh` | Trigger `wp-cron.php` and optionally force WP updates via WP-CLI in memory-safe mode | No (argument driven) | `root`/sudo |
 | `nx-manager.sh` | Nginx vhost create/update/delete + config test/reload | Yes | `root` |
 | `email-manager.sh` | Mail alias + Maildir permission audit for one email account | No (email argument) | `root`/sudo |
 
@@ -27,7 +27,8 @@ All scripts include a consistent CLI header/UI and are intended for Linux server
 - `mysql` and `mysqldump` available for DB scripts
 - Nginx layout using `/etc/nginx/sites-available` and `/etc/nginx/sites-enabled` (for `nx-manager.sh`, `wp-cron-master.sh`)
 - `curl` (for cron trigger mode)
-- `wp` (WP-CLI) + `sudo` (for forced updates mode)
+- `sudo` (for forced updates mode)
+- `wp` (WP-CLI) optional; required only for forced update mode in `wp-cron-master.sh`
 - `systemctl` + `nginx -t` support (for Nginx reload path)
 
 ## Quick Start
@@ -95,7 +96,7 @@ Environment overrides:
 Modes:
 
 ```bash
-./wp-cron-master.sh all      # default: cron trigger + forced updates
+./wp-cron-master.sh all      # default: cron trigger + forced updates (skips updates if WP-CLI missing)
 ./wp-cron-master.sh cron     # only wp-cron endpoint trigger
 ./wp-cron-master.sh updates  # only forced WP-CLI updates
 ./wp-cron-master.sh --help
@@ -109,6 +110,7 @@ Behavior:
   - `wp theme update --all`
   - WP language update commands
 - Runs updates as `www-data`
+- If `wp` is not installed, update phase is skipped with a warning.
 - Uses memory-safe default:
   - `WP_CLI_PHP_ARGS="-d memory_limit=256M"` (override supported)
 

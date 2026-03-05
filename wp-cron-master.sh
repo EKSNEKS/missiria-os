@@ -51,7 +51,7 @@ log_error() {
 usage() {
     cat <<'EOF'
 Usage: ./wp-cron-master.sh [all|cron|updates]
-  all      Run cron trigger + forced updates (default)
+  all      Run cron trigger + forced updates (default; updates skipped if WP-CLI is missing)
   cron     Run only wp-cron endpoint trigger
   updates  Run only forced WP-CLI updates
 EOF
@@ -148,12 +148,12 @@ run_forced_updates() {
     local updated_count=0 skipped_count=0 failed_count=0
 
     if ! command -v sudo >/dev/null 2>&1; then
-        log_error "sudo is required for forced updates."
-        return 1
+        log_warn "sudo is not available. Skipping forced updates phase."
+        return 0
     fi
     if ! command -v wp >/dev/null 2>&1; then
-        log_error "wp (WP-CLI) is required for forced updates."
-        return 1
+        log_warn "WP-CLI not found. Skipping forced updates phase."
+        return 0
     fi
 
     collect_wp_site_paths sites || return 1
