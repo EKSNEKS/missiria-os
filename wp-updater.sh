@@ -11,6 +11,7 @@ echo -e "${GREEN}======================================================${NC}"
 
 GLOBAL_START=$(date +%s)
 WP_CONFIGS=$(find /var/www/ -name "wp-config.php" -type f 2>/dev/null)
+DEAD_SITES=()
 
 for CONFIG in $WP_CONFIGS; do
     SITE_START=$(date +%s)
@@ -31,6 +32,7 @@ for CONFIG in $WP_CONFIGS; do
 
     HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L -m 5 "http://$DOMAIN")
     if [ "$HTTP_STATUS" -eq 000 ] || [ "$HTTP_STATUS" -ge 500 ]; then
+        DEAD_SITES+=("$DOMAIN (Status: $HTTP_STATUS)")
         echo -e "${RED}[DEAD] $DOMAIN (Status: $HTTP_STATUS). Skipping.${NC}"
         continue
     fi
@@ -109,12 +111,15 @@ EOF
 
     SITE_END=$(date +%s)
     DURATION=$((SITE_END - SITE_START))
+    UPDATE_TIME=$(date '+%Y/%m/%d %H:%M:%S')
 
     if [[ "$HTTP_RESP" == *"LOG_DATA"* ]]; then
         CLEAN_LOG=$(echo "$HTTP_RESP" | grep -o "LOG_DATA:.*")
         echo -e "${GREEN}✓ DONE in ${DURATION}s | $CLEAN_LOG${NC}"
+        echo -e "  Updated at: ${UPDATE_TIME}"
     else
         echo -e "${RED}✗ FAIL in ${DURATION}s | Response: $HTTP_RESP${NC}"
+        echo -e "  Attempted at: ${UPDATE_TIME}"
     fi
 
     # Cleanup
@@ -123,6 +128,13 @@ done
 
 GLOBAL_END=$(date +%s)
 TOTAL_TIME=$((GLOBAL_END - GLOBAL_START))
+if [ ${#DEAD_SITES[@]} -gt 0 ]; then
+    echo -e "\n${RED}Dead sites skipped during this run:${NC}"
+    for DEAD_SITE in "${DEAD_SITES[@]}"; do
+        echo -e "${RED}- $DEAD_SITE${NC}"
+    done
+fi
+
 echo -e "\n${GREEN}======================================================${NC}"
 echo -e "${GREEN} ✅ ALL SITES FINISHED IN ${TOTAL_TIME} SECONDS          ${NC}"
 echo -e "${GREEN}======================================================${NC}"
