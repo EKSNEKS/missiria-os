@@ -21,6 +21,10 @@ fi
 
 # Force WP-CLI to strictly use 256M max per process to prevent OOM kills.
 export WP_CLI_PHP_ARGS="${WP_CLI_PHP_ARGS:--d memory_limit=256M}"
+WP_CLI_BIN="${WP_CLI_BIN:-}"
+WP_CLI_DOWNLOAD_URL="${WP_CLI_DOWNLOAD_URL:-https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar}"
+
+declare -a WP_CLI_CMD=()
 
 print_header() {
     printf '%b\n' "${CYAN}______  ____________________________________________________${NC}"
@@ -51,9 +55,9 @@ log_error() {
 usage() {
     cat <<'EOF'
 Usage: ./wp-cron-master.sh [all|cron|updates]
-  all      Run cron trigger + forced updates (default; updates skipped if WP-CLI is missing)
+  all      Run cron trigger + forced updates (default; updates skipped only if WP-CLI cannot be resolved)
   cron     Run only wp-cron endpoint trigger
-  updates  Run only forced WP-CLI updates
+  updates  Run only forced WP-CLI updates (fails if updates cannot run)
 EOF
 }
 
@@ -87,23 +91,106 @@ collect_domains() {
     )
 }
 
-collect_wp_site_paths() {
-    local -n out_sites_ref="$1"
+collect_domain_root_pairs() {
     local -a nginx_files=()
     collect_nginx_files nginx_files || return 1
 
-    mapfile -t out_sites_ref < <(
-        awk '
-            /^[[:space:]]*root[[:space:]]+/ {
-                path = $2
-                gsub(/;|"/, "", path)
-                gsub(/\047/, "", path)
-                if (path ~ /^\//) {
-                    print path
+    awk '
+        function clean(v) {
+            gsub(/;|"/, "", v)
+            gsub(/\047/, "", v)
+            return v
+        }
+        function count_char(str, ch,    t) {
+            t = str
+            return gsub(ch, "", t)
+        }
+        function flush_block() {
+            if (!in_server) {
+                return
+            }
+            if (root != "" && domain_count > 0) {
+                for (i = 1; i <= domain_count; i++) {
+                    print root "|" domains[i] "|" FILENAME
                 }
             }
-        ' "${nginx_files[@]}" | sort -u
-    )
+            delete domains
+            domain_count = 0
+            root = ""
+        }
+        /^[[:space:]]*server[[:space:]]*\{/ {
+            flush_block()
+            in_server = 1
+            depth = 1
+            next
+        }
+        in_server {
+            if ($0 ~ /^[[:space:]]*server_name[[:space:]]+/) {
+                for (i = 2; i <= NF; i++) {
+                    d = clean($i)
+                    if (d != "" && d != "_" && d !~ /^~/) {
+                        domains[++domain_count] = d
+                    }
+                }
+            } else if ($0 ~ /^[[:space:]]*root[[:space:]]+/) {
+                r = clean($2)
+                if (r ~ /^\//) {
+                    root = r
+                }
+            }
+
+            depth += count_char($0, "{")
+            depth -= count_char($0, "}")
+            if (depth <= 0) {
+                flush_block()
+                in_server = 0
+                depth = 0
+            }
+            next
+        }
+        END {
+            flush_block()
+        }
+    ' "${nginx_files[@]}" | sort -u
+}
+
+resolve_wp_cli() {
+    local tmp_wp_cli
+
+    if [[ -n "$WP_CLI_BIN" && -x "$WP_CLI_BIN" ]]; then
+        WP_CLI_CMD=("$WP_CLI_BIN")
+        return 0
+    fi
+
+    if command -v wp >/dev/null 2>&1; then
+        WP_CLI_CMD=("wp")
+        return 0
+    fi
+
+    if ! command -v php >/dev/null 2>&1; then
+        return 1
+    fi
+
+    tmp_wp_cli="/tmp/wp-cli.phar"
+    if [[ ! -f "$tmp_wp_cli" ]]; then
+        if ! command -v curl >/dev/null 2>&1; then
+            return 1
+        fi
+        log_warn "WP-CLI not found in PATH. Downloading temporary wp-cli.phar..."
+        if ! curl -fsSL "$WP_CLI_DOWNLOAD_URL" -o "$tmp_wp_cli"; then
+            log_warn "Temporary WP-CLI download failed."
+            return 1
+        fi
+    fi
+
+    chmod +x "$tmp_wp_cli" 2>/dev/null || true
+    if php "$tmp_wp_cli" --info >/dev/null 2>&1; then
+        WP_CLI_CMD=("php" "$tmp_wp_cli")
+        log_warn "Using temporary WP-CLI binary: $tmp_wp_cli"
+        return 0
+    fi
+
+    return 1
 }
 
 run_cron_trigger() {
@@ -143,41 +230,74 @@ run_cron_trigger() {
 }
 
 run_forced_updates() {
-    local -a sites=()
-    local site_path
+    local strict_mode="${1:-0}"
+    local -a pairs=()
+    local -a roots=()
+    local site_path domains pair root domain source wp_flag
     local updated_count=0 skipped_count=0 failed_count=0
 
     if ! command -v sudo >/dev/null 2>&1; then
+        if [[ "$strict_mode" == "1" ]]; then
+            log_error "sudo is required for forced updates."
+            return 1
+        fi
         log_warn "sudo is not available. Skipping forced updates phase."
         return 0
     fi
-    if ! command -v wp >/dev/null 2>&1; then
+
+    if ! resolve_wp_cli; then
+        if [[ "$strict_mode" == "1" ]]; then
+            log_error "WP-CLI is required for updates and could not be resolved."
+            return 1
+        fi
         log_warn "WP-CLI not found. Skipping forced updates phase."
         return 0
     fi
 
-    collect_wp_site_paths sites || return 1
-    if ((${#sites[@]} == 0)); then
-        log_warn "No root paths found from Nginx configs."
+    mapfile -t pairs < <(collect_domain_root_pairs)
+    if ((${#pairs[@]} == 0)); then
+        log_warn "No domain/root pairs found from Nginx configs."
         return 0
     fi
 
-    log_info "Forcing immediate WP updates (Memory-Safe Mode) on ${#sites[@]} path(s)..."
-    for site_path in "${sites[@]}"; do
+    log_info "Detected domains from Nginx (domain -> root -> wordpress):"
+    for pair in "${pairs[@]}"; do
+        IFS='|' read -r root domain source <<< "$pair"
+        if [[ -f "$root/wp-config.php" ]]; then
+            wp_flag="yes"
+        else
+            wp_flag="no"
+        fi
+        log_info " - ${domain} -> ${root} -> wp-config.php: ${wp_flag}"
+    done
+
+    mapfile -t roots < <(printf '%s\n' "${pairs[@]}" | cut -d'|' -f1 | sort -u)
+    log_info "Forcing immediate WP updates (Memory-Safe Mode) on ${#roots[@]} unique site root(s)..."
+
+    for site_path in "${roots[@]}"; do
+        domains="$(
+            printf '%s\n' "${pairs[@]}" \
+                | awk -F'|' -v target_root="$site_path" '$1 == target_root {print $2}' \
+                | sort -u | paste -sd ',' -
+        )"
+        domains="${domains:-unknown-domain}"
+
         if [[ ! -d "$site_path" || ! -f "$site_path/wp-config.php" ]]; then
+            log_warn "Skipping non-WordPress root: ${site_path} (domains: ${domains})"
             skipped_count=$((skipped_count + 1))
             continue
         fi
 
         printf '\n'
         log_warn "Forcing updates for -> ${site_path}"
+        log_info "Domains: ${domains}"
 
-        if sudo -u www-data wp core update --path="$site_path" --quiet \
-            && sudo -u www-data wp plugin update --all --path="$site_path" --quiet \
-            && sudo -u www-data wp theme update --all --path="$site_path" --quiet \
-            && sudo -u www-data wp language core update --path="$site_path" --quiet \
-            && sudo -u www-data wp language plugin update --all --path="$site_path" --quiet \
-            && sudo -u www-data wp language theme update --all --path="$site_path" --quiet; then
+        if sudo -u www-data "${WP_CLI_CMD[@]}" core update --path="$site_path" --quiet \
+            && sudo -u www-data "${WP_CLI_CMD[@]}" plugin update --all --path="$site_path" --quiet \
+            && sudo -u www-data "${WP_CLI_CMD[@]}" theme update --all --path="$site_path" --quiet \
+            && sudo -u www-data "${WP_CLI_CMD[@]}" language core update --path="$site_path" --quiet \
+            && sudo -u www-data "${WP_CLI_CMD[@]}" language plugin update --all --path="$site_path" --quiet \
+            && sudo -u www-data "${WP_CLI_CMD[@]}" language theme update --all --path="$site_path" --quiet; then
             log_ok "✓ Updates completed for ${site_path}"
             updated_count=$((updated_count + 1))
         else
@@ -202,13 +322,13 @@ main() {
         all)
             run_cron_trigger
             printf '\n'
-            run_forced_updates
+            run_forced_updates 0
             ;;
         cron)
             run_cron_trigger
             ;;
         updates)
-            run_forced_updates
+            run_forced_updates 1
             ;;
         -h|--help|help)
             usage
