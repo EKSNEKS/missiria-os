@@ -6,7 +6,7 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${GREEN}======================================================${NC}"
-echo -e "${GREEN} Forcing Direct Manual Upgrades (Plugins + Translations)${NC}"
+echo -e "${GREEN} Forcing FULL Upgrades (Core + Plugins + Languages)   ${NC}"
 echo -e "${GREEN}======================================================${NC}"
 
 WP_CONFIGS=$(find /var/www/ -name "wp-config.php" -type f 2>/dev/null)
@@ -17,91 +17,79 @@ if [ -z "$WP_CONFIGS" ]; then
 fi
 
 for CONFIG in $WP_CONFIGS; do
-    
+
     DOMAIN=""
-    NGINX_CONF=""
     SITE_PATH=$(dirname "$CONFIG")
-    
     NGINX_CONF=$(grep -Rl "$SITE_PATH" /etc/nginx/sites-enabled/ 2>/dev/null | head -n 1)
-    
+
     if [ -n "$NGINX_CONF" ]; then
         DOMAIN=$(grep -E "^\s*server_name" "$NGINX_CONF" | head -n 1 | awk '{print $2}' | tr -d ';')
     fi
-    
+
     if [ -z "$DOMAIN" ] || [ "$DOMAIN" == "_" ]; then
-        echo -e "\n${RED}Skipping -> $SITE_PATH (No active Nginx config found)${NC}"
         continue
     fi
 
-    echo -e "\n${YELLOW}Folder: $SITE_PATH${NC}"
-    echo -e "${YELLOW}Injecting payload and hitting -> $DOMAIN${NC}"
-    
+    echo -e "\n${YELLOW}Checking -> $DOMAIN${NC}"
+
     # ---------------------------------------------------------
-    # NEW PHP PAYLOAD WITH TRANSLATION UPGRADER
+    # INJECTING THE FULL POWER PAYLOAD
     # ---------------------------------------------------------
     cat << 'EOF' > "$SITE_PATH/missiria-trigger.php"
 <?php
 define('FS_METHOD', 'direct');
 define('WP_USE_THEMES', false);
-set_time_limit(0);
-ignore_user_abort(true);
+set_time_limit(300);
 
 require('./wp-load.php');
 require_once(ABSPATH . 'wp-admin/includes/admin.php');
 require_once(ABSPATH . 'wp-admin/includes/file.php');
-require_once(ABSPATH . 'wp-admin/includes/misc.php');
 require_once(ABSPATH . 'wp-admin/includes/class-wp-upgrader.php');
 
-// Force WP to check for core/translation updates first
+// 0. Aggressive Cache Clear
 wp_clean_update_cache();
-wp_version_check(); 
+delete_site_transient('update_core');
+delete_site_transient('update_plugins');
+wp_version_check();
 wp_update_plugins();
-wp_update_themes();
 
 $skin = new Automatic_Upgrader_Skin();
-$status = "OK";
 
-// 1. Force Bulk Plugin Upgrade
+// 1. FORCE CORE UPDATE (Fixes the 6.9.1 -> 6.9.3 issue)
+$core_updates = get_core_updates();
+if (isset($core_updates[0]) && $core_updates[0]->response == 'upgrade') {
+    $core_upgrader = new Core_Upgrader($skin);
+    $core_upgrader->upgrade($core_updates[0]);
+}
+
+// 2. PLUGINS
 $plugin_updates = get_site_transient('update_plugins');
 if (!empty($plugin_updates->response)) {
     $plugin_upgrader = new Plugin_Upgrader($skin);
-    $plugins_to_update = array_keys($plugin_updates->response);
-    $plugin_upgrader->bulk_upgrade($plugins_to_update);
+    $plugin_upgrader->bulk_upgrade(array_keys($plugin_updates->response));
 }
 
-// 2. Force Bulk Theme Upgrade
-$theme_updates = get_site_transient('update_themes');
-if (!empty($theme_updates->response)) {
-    $theme_upgrader = new Theme_Upgrader($skin);
-    $themes_to_update = array_keys($theme_updates->response);
-    $theme_upgrader->bulk_upgrade($themes_to_update);
-}
-
-// 3. Force Translation Upgrade (NEW)
+// 3. TRANSLATIONS
 $language_updates = wp_get_translation_updates();
 if (!empty($language_updates)) {
     $language_upgrader = new Language_Pack_Upgrader($skin);
     $language_upgrader->bulk_upgrade($language_updates);
 }
 
-echo $status;
+echo "OK_COMPLETE";
 EOF
 
     chown www-data:www-data "$SITE_PATH/missiria-trigger.php"
-    
-    HTTP_RESP=$(curl -s -L -m 180 "http://$DOMAIN/missiria-trigger.php")
-    
-    if [[ "$HTTP_RESP" == *"OK"* ]]; then
-        echo -e "${GREEN}✓ Upgrades successfully forced on $DOMAIN! Output: $HTTP_RESP${NC}"
-    else
-        echo -e "${RED}✗ cURL failed for $DOMAIN. Output: $HTTP_RESP${NC}"
-    fi
-    
-    rm -f "$SITE_PATH/missiria-trigger.php"
-    
-    sleep 3
-done
 
-echo -e "\n${GREEN}======================================================${NC}"
-echo -e "${GREEN} All active sites updated successfully.               ${NC}"
-echo -e "${GREEN}======================================================${NC}"
+    # Run the trigger
+    HTTP_RESP=$(curl -s -L -m 300 "http://$DOMAIN/missiria-trigger.php")
+
+    if [[ "$HTTP_RESP" == *"OK_COMPLETE"* ]]; then
+        echo -e "${GREEN}✓ FULL Success on $DOMAIN!${NC}"
+    else
+        echo -e "${RED}✗ Error on $DOMAIN. Response: $HTTP_RESP${NC}"
+    fi
+
+    # Cleanup
+    rm -f "$SITE_PATH/missiria-trigger.php"
+done
