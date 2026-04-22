@@ -8,6 +8,7 @@ MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
 DEFAULT_BACKUP_DIR="${DEFAULT_BACKUP_DIR:-/tmp}"
 DEFAULT_EXPORT_PATH="${DEFAULT_EXPORT_PATH:-/home/missiria/dump.sql}"
+DEFAULT_IMPORT_PATH="${DEFAULT_IMPORT_PATH:-/home/missiria/dump.sql}"
 
 if [[ -t 1 ]]; then
     RED=$'\033[0;31m'
@@ -247,6 +248,43 @@ drop_database() {
     log "Database '$db_name' has been deleted."
 }
 
+create_database() {
+    local db_name db_quoted dump_file
+
+    read -r -p "Enter the new database name: " db_name
+    [[ -z "$db_name" ]] && {
+        error "Database name is required."
+        return
+    }
+
+    if database_exists "$db_name"; then
+        error "Database '$db_name' already exists."
+        return
+    fi
+
+    db_quoted="$(quote_identifier "$db_name")"
+    mysql_exec -e "CREATE DATABASE ${db_quoted};" || {
+        error "Failed to create database '$db_name'."
+        return
+    }
+    log "Database '$db_name' has been created."
+
+    read -r -p "SQL dump file path to import [${DEFAULT_IMPORT_PATH}]: " dump_file
+    dump_file="${dump_file:-$DEFAULT_IMPORT_PATH}"
+
+    if [[ ! -f "$dump_file" ]]; then
+        error "Dump file not found: $dump_file"
+        return
+    fi
+
+    log "Importing '${dump_file}' into '${db_name}'..."
+    if mysql_exec_db "$db_name" < "$dump_file"; then
+        log "SUCCESS: Dump imported into '${db_name}'."
+    else
+        error "Import failed for '${db_name}'."
+    fi
+}
+
 global_search_replace() {
     local db_name search_text replace_text
     read -r -p "Enter the database name: " db_name
@@ -445,27 +483,29 @@ show_main_menu() {
     log "${BLUE}----------------------------------------${NC}"
     log "${BLUE}1)${NC} CLEANUP Tables inside a database (Prefix or Plugins)"
     log "${BLUE}2)${NC} DROP an entire database"
-    log "${BLUE}3)${NC} SEARCH & REPLACE text across ALL tables (Global)"
-    log "${BLUE}4)${NC} LAUNCH WORDPRESS MANAGER (wp-manager.sh)"
-    log "${BLUE}5)${NC} RENAME Physical Files in a Directory (e.g., Media Uploads)"
-    log "${BLUE}6)${NC} EXPORT a Database (Quick Select by Number)"
-    log "${BLUE}7)${NC} EXIT"
+    log "${BLUE}3)${NC} CREATE a database and IMPORT a SQL dump"
+    log "${BLUE}4)${NC} SEARCH & REPLACE text across ALL tables (Global)"
+    log "${BLUE}5)${NC} LAUNCH WORDPRESS MANAGER (wp-manager.sh)"
+    log "${BLUE}6)${NC} RENAME Physical Files in a Directory (e.g., Media Uploads)"
+    log "${BLUE}7)${NC} EXPORT a Database (Quick Select by Number)"
+    log "${BLUE}8)${NC} EXIT"
 }
 
 main() {
     local main_choice
     while true; do
         show_main_menu
-        read -r -p "Choice [1-7]: " main_choice
+        read -r -p "Choice [1-8]: " main_choice
 
         case "$main_choice" in
             1) cleanup_tables ;;
             2) drop_database ;;
-            3) global_search_replace ;;
-            4) launch_wp_manager ;;
-            5) mass_file_renamer ;;
-            6) export_database ;;
-            7)
+            3) create_database ;;
+            4) global_search_replace ;;
+            5) launch_wp_manager ;;
+            6) mass_file_renamer ;;
+            7) export_database ;;
+            8)
                 log "Exiting."
                 return 0
                 ;;
