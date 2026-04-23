@@ -48,6 +48,17 @@ for CONFIG in $WP_CONFIGS; do
     echo -e "\n${YELLOW}▶ Processing: $DOMAIN${NC}"
 
     # ---------------------------------------------------------
+    # TRIGGER WP-CRON FOR MISSED SCHEDULED POSTS
+    # ---------------------------------------------------------
+    # Using -L to follow the HTTP -> HTTPS redirect in your Nginx config
+    CRON_HTTP=$(curl -o /dev/null -s -w "%{http_code}" -L -m 15 "http://$DOMAIN/wp-cron.php?doing_wp_cron")
+    if [ "$CRON_HTTP" -eq 200 ]; then
+        echo -e "${GREEN}✓ WP-Cron triggered (Schedules Published)${NC}"
+    else
+        echo -e "${RED}✗ WP-Cron failed (HTTP Status: $CRON_HTTP)${NC}"
+    fi
+
+    # ---------------------------------------------------------
     # NEW PAYLOAD WITH STRICT ERROR LOGGING
     # ---------------------------------------------------------
     cat << 'EOF' > "$SITE_PATH/$TRIGGER_FILE"

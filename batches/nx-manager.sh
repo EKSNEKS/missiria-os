@@ -18,11 +18,11 @@ NC='\033[0m' # No Color
 
 print_header() {
     printf '%b\n' "${CYAN}______  ____________________________________________________${NC}"
-    printf '%b\n' "${CYAN}___   |/  /___  _/_  ___/_  ___/___  _/__  __ \\___  _/__    |${NC}"
-    printf '%b\n' "${CYAN}__  /|_/ / __  / _____ \\_____ \\ __  / __  /_/ /__  / __  /| |${NC}"
+    printf '%b\n' "${CYAN}___   |/  /___  _/_  ___/_  ___/___  _/__  __ \___  _/__    |${NC}"
+    printf '%b\n' "${CYAN}__  /|_/ / __  / _____ \_____ \ __  / __  /_/ /__  / __  /| |${NC}"
     printf '%b\n' "${CYAN}_  /  / / __/ /  ____/ /____/ /__/ /  _  _, _/__/ /  _  ___ |${NC}"
     printf '%b\n' "${CYAN}/_/  /_/  /___/  /____/ /____/ /___/  /_/ |_| /___/  /_/  |_|${NC}"
-    printf '%b\n' "${CYAN}                                                             v2${NC}"
+    printf '%b\n' "${CYAN}                                                           v3${NC}"
     printf '%b\n' "${GREEN}NGINX MANAGER${NC}"
 }
 
@@ -102,7 +102,7 @@ insert_domain() {
     chmod -R 755 "$WEB_ROOT"
 
     echo -e "${CYAN}📝 Generating Nginx configuration for WordPress/PHP...${NC}"
-    
+
     cat > "$AVAIL" <<EOF
 server {
     listen 80;
@@ -129,9 +129,100 @@ server {
 EOF
 
     echo -e "${GREEN}✅ Nginx configuration generated at $AVAIL${NC}"
-    
+
     # Automatically update/link the newly created domain
     update_domain "$DOMAIN"
+}
+
+enable_varnish() {
+    DOMAIN=$1
+    AVAIL="/etc/nginx/sites-available/$DOMAIN"
+
+    if [ ! -f "$AVAIL" ]; then
+        echo -e "${RED}❌ Error: Configuration for $DOMAIN not found in sites-available.${NC}"
+        return
+    fi
+
+    echo -e "${CYAN}📦 Backing up original configuration to ${AVAIL}.bak...${NC}"
+    cp "$AVAIL" "${AVAIL}.bak"
+
+    read -p "Enter the web root directory (Default: /var/www/MISSIRIA/$DOMAIN): " WEB_ROOT
+    WEB_ROOT=${WEB_ROOT:-/var/www/MISSIRIA/$DOMAIN}
+    read -p "Enter PHP version for backend (Default: 8.3): " PHP_VER
+    PHP_VER=${PHP_VER:-8.3}
+
+    echo -e "${CYAN}📝 Injecting Varnish Architecture into Nginx configuration...${NC}"
+    
+    cat > "$AVAIL" <<EOF
+# ---------------------------------------------------------
+# 1. THE BACKEND (Port 8080)
+# ---------------------------------------------------------
+server {
+    listen 8080;
+    server_name $DOMAIN www.$DOMAIN;
+    root $WEB_ROOT;
+    index index.php index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php${PHP_VER}-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    # Webmail
+    include /etc/nginx/snippets/roundcube-webmail.conf;
+}
+
+# ---------------------------------------------------------
+# 2. THE FRONT DOOR (Port 443 -> 6081)
+# ---------------------------------------------------------
+server {
+    listen [::]:443 ssl;
+    listen 443 ssl;
+    server_name $DOMAIN www.$DOMAIN;
+
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:6081;
+        
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
+    }
+}
+EOF
+
+    echo -e "${GREEN}✅ Varnish configuration applied for $DOMAIN.${NC}"
+    
+    # Reload Nginx using your existing function
+    update_domain "$DOMAIN"
+
+    echo -e "${CYAN}🔍 Executing curl test for Varnish Cache...${NC}"
+    sleep 2 # Give Nginx a second to breathe
+    
+    HEADERS=$(curl -I -s "https://$DOMAIN")
+    
+    if echo "$HEADERS" | grep -i 'x-varnish' > /dev/null; then
+        echo -e "${GREEN}🚀 SUCCESS: Varnish is ACTIVE! Here are your cache headers:${NC}"
+        echo "$HEADERS" | grep -i -E 'x-cache|age|x-varnish|via'
+    else
+        echo -e "${RED}⚠️ WARNING: Varnish headers not detected. Ensure Certbot SSL files exist for this domain.${NC}"
+    fi
 }
 
 # --- MAIN MENU UI ---
@@ -142,8 +233,9 @@ echo
 echo -e "${BLUE}1)${NC} Update / Reload Server Nginx (Synginx)"
 echo -e "${BLUE}2)${NC} Delete Server Nginx (Delginx)"
 echo -e "${BLUE}3)${NC} Insert / Create New Domain"
-echo -e "${BLUE}4)${NC} Exit"
-read -p "Select an option [1-4]: " OPTION
+echo -e "${BLUE}4)${NC} Deploy & Test Varnish Cache"
+echo -e "${BLUE}5)${NC} Exit"
+read -p "Select an option [1-5]: " OPTION
 
 case $OPTION in
     1)
@@ -159,6 +251,10 @@ case $OPTION in
         [[ -n "$INPUT_DOMAIN" ]] && insert_domain "$INPUT_DOMAIN" || echo -e "${RED}Domain required.${NC}"
         ;;
     4)
+        read -p "Enter the domain to ACTIVATE VARNISH for: " INPUT_DOMAIN
+        [[ -n "$INPUT_DOMAIN" ]] && enable_varnish "$INPUT_DOMAIN" || echo -e "${RED}Domain required.${NC}"
+        ;;
+    5)
         echo -e "${GREEN}Exiting...${NC}"
         exit 0
         ;;
