@@ -4,6 +4,7 @@ Operational shell toolkit for day-to-day infrastructure and WordPress maintenanc
 
 This repository provides interactive scripts to manage:
 - MySQL databases
+- MySQL database creation + grants
 - WordPress database maintenance
 - Nginx virtual hosts
 - Mailbox diagnostics
@@ -15,6 +16,7 @@ All scripts include a consistent CLI header/UI and are intended for Linux server
 
 | Script | Purpose | Interactive | Typical Privilege |
 |---|---|---|---|
+| `create_db.sh` | Create a MySQL database and optionally grant access to a target user | Yes | `root`/DB admin |
 | `db-manager.sh` | Generic DB operations (cleanup, drop, global replace, export, file rename, WP manager launcher) | Yes | `root`/DB admin |
 | `wp-manager.sh` | WordPress-focused DB operations (migration, content cleanup, maintenance bundle) | Yes | `root`/DB admin |
 | `wp-cron-master.sh` | Trigger `wp-cron.php` and optionally force WP updates via WP-CLI in memory-safe mode | No (argument driven) | `root`/sudo |
@@ -42,6 +44,7 @@ chmod +x *.sh batches/*.sh
 Run scripts:
 
 ```bash
+./batches/create_db.sh
 ./db-manager.sh
 ./wp-manager.sh
 ./nx-manager.sh
@@ -51,6 +54,28 @@ Run scripts:
 ```
 
 ## Script Usage
+
+### `create_db.sh`
+
+Usage:
+
+```bash
+./batches/create_db.sh
+```
+
+Behavior:
+- Lists existing MySQL databases before prompting
+- Creates the requested database with `CREATE DATABASE IF NOT EXISTS`
+- Prompts whether to grant DB permissions to a user
+- If grants are enabled, prompts for user and host
+- Defaults grant target to `missiria@localhost`
+- Applies `GRANT ALL PRIVILEGES` only when that grant step is confirmed
+
+Environment overrides:
+- `DB_USER` (default: `root`)
+- `MYSQL_BIN` (default: `mysql`)
+- `DEFAULT_GRANT_USER` (default: `missiria`)
+- `DEFAULT_GRANT_HOST` (default: `localhost`)
 
 ### `db-manager.sh`
 
