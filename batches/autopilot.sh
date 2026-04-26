@@ -25,6 +25,8 @@ NC='\033[0m'
 # ── MySQL settings ───────────────────────────────────────────
 DB_USER="${DB_USER:-missiria}"
 DB_PASS="${DB_PASS:-}"
+MYSQL_ADMIN_USER="${MYSQL_ADMIN_USER:-root}"
+MYSQL_ADMIN_PASS="${MYSQL_ADMIN_PASS:-}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
 
@@ -92,12 +94,14 @@ sql_escape_literal() {
 quote_identifier() {
     local v="$1"; v="${v//\`/\`\`}"; printf '`%s`' "$v"
 }
-mysql_exec()    { MYSQL_PWD="$DB_PASS" "$MYSQL_BIN" -u "$DB_USER" "$@"; }
-mysql_exec_db() { local db="$1"; shift; MYSQL_PWD="$DB_PASS" "$MYSQL_BIN" -u "$DB_USER" -D "$db" "$@"; }
+mysql_exec()     { MYSQL_PWD="$DB_PASS"       "$MYSQL_BIN" -u "$DB_USER"       "$@"; }
+mysql_exec_db()  { local db="$1"; shift; MYSQL_PWD="$DB_PASS"       "$MYSQL_BIN" -u "$DB_USER"       -D "$db" "$@"; }
+mysql_admin()    { MYSQL_PWD="$MYSQL_ADMIN_PASS" "$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" "$@"; }
+mysql_admin_db() { local db="$1"; shift; MYSQL_PWD="$MYSQL_ADMIN_PASS" "$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" -D "$db" "$@"; }
 database_exists() {
     local esc result
     esc="$(sql_escape_literal "$1")"
-    result="$(mysql_exec -N -s -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${esc}' LIMIT 1;" 2>/dev/null || true)"
+    result="$(mysql_admin -N -s -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${esc}' LIMIT 1;" 2>/dev/null || true)"
     [[ "$result" == "$1" ]]
 }
 
@@ -185,7 +189,7 @@ intake_copy_source() {
     local -a db_list=()
     while IFS= read -r row; do
         [[ -n "$row" ]] && db_list+=("$row")
-    done < <(mysql_exec -N -s -e "SHOW DATABASES;" 2>/dev/null | grep -vE '^(information_schema|performance_schema|mysql|sys)$')
+    done < <(mysql_admin -N -s -e "SHOW DATABASES;" 2>/dev/null | grep -vE '^(information_schema|performance_schema|mysql|sys)$')
 
     if ((${#db_list[@]} > 0)); then
         echo ""
@@ -472,8 +476,14 @@ _db_create_new() {
     if database_exists "$DB_NAME"; then
         warn "Database '$DB_NAME' already exists — skipping creation."
     else
-        if mysql_exec -e "CREATE DATABASE ${db_quoted} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
-            ok "Database '$DB_NAME' created (utf8mb4)."
+        local db_user_esc; db_user_esc="$(sql_escape_literal "$DB_USER")"
+        if mysql_admin <<EOF
+CREATE DATABASE ${db_quoted} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+GRANT ALL PRIVILEGES ON ${db_quoted}.* TO '${db_user_esc}'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+        then
+            ok "Database '$DB_NAME' created and privileges granted to '$DB_USER'@localhost."
         else
             fail "Failed to create database '$DB_NAME'."
             return
@@ -509,10 +519,16 @@ _db_clone() {
 
     if database_exists "$DB_NAME"; then
         warn "Database '$DB_NAME' exists — dropping and recreating."
-        mysql_exec -e "DROP DATABASE ${db_quoted};"
+        mysql_admin -e "DROP DATABASE ${db_quoted};"
     fi
 
-    if ! mysql_exec -e "CREATE DATABASE ${db_quoted} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+    local db_user_esc; db_user_esc="$(sql_escape_literal "$DB_USER")"
+    if ! mysql_admin <<EOF
+CREATE DATABASE ${db_quoted} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+GRANT ALL PRIVILEGES ON ${db_quoted}.* TO '${db_user_esc}'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+    then
         fail "Failed to create database '$DB_NAME'."
         rm -f "$tmp_dump"
         return
