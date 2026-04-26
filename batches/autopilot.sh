@@ -280,9 +280,20 @@ intake_mysql_admin() {
     echo ""
     printf '%b\n' "  ${CYAN}── MYSQL ADMIN ───────────────────────────────────────${NC}"
 
-    if [[ -n "$MYSQL_ADMIN_PASS" ]]; then
-        printf '%b\n' "  ${GREEN}✅  MySQL admin password already set via env (MYSQL_ADMIN_PASS).${NC}"
+    # Try socket auth first (works when running as root with auth_socket plugin)
+    if "$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" -e "SELECT 1;" &>/dev/null; then
+        MYSQL_ADMIN_PASS=""
+        printf '%b\n' "  ${GREEN}✅  MySQL admin connected via socket (no password needed).${NC}"
         return
+    fi
+
+    if [[ -n "$MYSQL_ADMIN_PASS" ]]; then
+        if MYSQL_PWD="$MYSQL_ADMIN_PASS" "$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" -e "SELECT 1;" &>/dev/null; then
+            printf '%b\n' "  ${GREEN}✅  MySQL admin password already set via env (MYSQL_ADMIN_PASS).${NC}"
+            return
+        fi
+        printf '%b\n' "  ${RED}❌  MYSQL_ADMIN_PASS env var set but connection failed — clearing it.${NC}"
+        MYSQL_ADMIN_PASS=""
     fi
 
     local attempts=0
@@ -305,6 +316,20 @@ intake_mysql_admin() {
             exit 1
         fi
     done
+}
+
+check_mysql_health() {
+    printf '%b\n' "  ${CYAN}── DB HEALTH CHECK ──────────────────────────────────${NC}"
+    if "$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" -e "SELECT 1;" &>/dev/null; then
+        local db_count
+        db_count=$("$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" -N -s -e \
+            "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys');" 2>/dev/null)
+        printf '%b\n' "  ${GREEN}✅  MySQL is up — ${db_count} site database(s) found.${NC}"
+    else
+        printf '%b\n' "  ${RED}❌  MySQL is NOT reachable. Cannot continue.${NC}"
+        printf '%b\n' "  ${YELLOW}    Run: systemctl start mysql${NC}"
+        exit 1
+    fi
 }
 
 print_summary() {
@@ -915,6 +940,7 @@ exec_audit() {
 
 main() {
     print_header
+    check_mysql_health
 
     # ── PHASE 1: INTAKE ──────────────────────────────────────
     printf '%b\n' "${CYAN}${BOLD}  ╔══════════════════════════════════════════════════╗${NC}"
