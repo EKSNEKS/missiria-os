@@ -23,7 +23,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ── MySQL settings ───────────────────────────────────────────
-DB_USER="${DB_USER:-root}"
+DB_USER="${DB_USER:-missiria}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
 

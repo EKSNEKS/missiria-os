@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-DB_USER="${DB_USER:-root}"
+DB_USER="${DB_USER:-missiria}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
 DEFAULT_BACKUP_DIR="${DEFAULT_BACKUP_DIR:-/tmp}"

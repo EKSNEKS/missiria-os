@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration - Update these or ensure ~/.my.cnf is configured
-DB_USER="${DB_USER:-root}"
+DB_USER="${DB_USER:-missiria}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 DEFAULT_GRANT_USER="${DEFAULT_GRANT_USER:-missiria}"
 DEFAULT_GRANT_HOST="${DEFAULT_GRANT_HOST:-localhost}"
