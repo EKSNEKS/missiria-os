@@ -24,6 +24,7 @@ NC='\033[0m'
 
 # ── MySQL settings ───────────────────────────────────────────
 DB_USER="${DB_USER:-missiria}"
+DB_PASS="${DB_PASS:-}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
 
@@ -91,8 +92,8 @@ sql_escape_literal() {
 quote_identifier() {
     local v="$1"; v="${v//\`/\`\`}"; printf '`%s`' "$v"
 }
-mysql_exec()    { "$MYSQL_BIN" -u "$DB_USER" "$@"; }
-mysql_exec_db() { local db="$1"; shift; "$MYSQL_BIN" -u "$DB_USER" -D "$db" "$@"; }
+mysql_exec()    { MYSQL_PWD="$DB_PASS" "$MYSQL_BIN" -u "$DB_USER" "$@"; }
+mysql_exec_db() { local db="$1"; shift; MYSQL_PWD="$DB_PASS" "$MYSQL_BIN" -u "$DB_USER" -D "$db" "$@"; }
 database_exists() {
     local esc result
     esc="$(sql_escape_literal "$1")"
@@ -500,7 +501,7 @@ _db_clone() {
 
     local tmp_dump="/tmp/autopilot_${SRC_DB}_$(date +%s).sql"
     info "Exporting '$SRC_DB' ..."
-    if ! "$MYSQLDUMP_BIN" -u "$DB_USER" "$SRC_DB" > "$tmp_dump"; then
+    if ! MYSQL_PWD="$DB_PASS" "$MYSQLDUMP_BIN" -u "$DB_USER" "$SRC_DB" > "$tmp_dump"; then
         fail "Export of '$SRC_DB' failed."
         return
     fi
