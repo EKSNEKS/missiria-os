@@ -17,7 +17,7 @@ DEFAULT_GRANT_HOST="${DEFAULT_GRANT_HOST:-localhost}"
 # ─── Colors ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
-    BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+    BLUE=$'\033[0;94m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 else
     RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; NC=""
 fi
@@ -434,6 +434,8 @@ show_db_info() {
     log ""
     info "--- Charset / Collation ---"
     mysql_exec -e "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${db_esc}';"
+    log ""
+    read -r -p "Press [Enter] to return to main menu..."
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -898,9 +900,6 @@ wp_tools_menu() {
 show_main_menu() {
     clear 2>/dev/null || true
     print_header
-    log ""
-    info "--- Databases ---"
-    mysql_exec -e "SHOW DATABASES;" 2>/dev/null || error "Could not connect to MySQL."
     log ""
     printf '%b\n' "${BOLD}${BLUE}─── Database Operations ──────────────────────────────────${NC}"
     printf '%b  1)%b CREATE database  (+ optional user grant + import)\n' "$BLUE" "$NC"
