@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-DB_USER="${DB_USER:-missiria}"
+DB_USER="${DB_USER:-root}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
 DEFAULT_BACKUP_DIR="${DEFAULT_BACKUP_DIR:-/tmp}"
@@ -935,6 +935,8 @@ main() {
                 error "Invalid option."
                 ;;
         esac
+
+        [[ "$choice" != "11" ]] && read -r -p $'\nPress Enter to return to menu...'
     done
 }
 

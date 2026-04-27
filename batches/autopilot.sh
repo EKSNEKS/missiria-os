@@ -246,9 +246,21 @@ intake_database() {
         ask "SQL dump to import after creation (blank = empty DB):"
         read -r DB_DUMP
     else
-        ask "FROM URL — source site [https://$SRC_DOMAIN]:"
+        # Auto-detect siteurl from the source WordPress database
+        local src_siteurl=""
+        if [[ -n "$SRC_DB" ]]; then
+            local opts_table
+            opts_table="$(mysql_admin -N -s -D "$SRC_DB" -e "SHOW TABLES LIKE '%\_options';" 2>/dev/null | head -1)"
+            if [[ -n "$opts_table" ]]; then
+                src_siteurl="$(mysql_admin -N -s -D "$SRC_DB" -e "SELECT option_value FROM \`${opts_table}\` WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null | head -1)"
+            fi
+        fi
+        local default_old_url="${src_siteurl:-https://$SRC_DOMAIN}"
+        [[ -n "$src_siteurl" ]] && info "Auto-detected source URL: $src_siteurl"
+
+        ask "FROM URL — source site [$default_old_url]:"
         read -r OLD_URL
-        OLD_URL="${OLD_URL:-https://$SRC_DOMAIN}"
+        OLD_URL="${OLD_URL:-$default_old_url}"
 
         ask "TO URL   — new site   [https://$DOMAIN]:"
         read -r NEW_URL
@@ -859,7 +871,18 @@ _db_migrate_urls() {
     posts="$(quote_identifier "${WP_PREFIX}posts")"
     postmeta="$(quote_identifier "${WP_PREFIX}postmeta")"
 
+    # Show the actual siteurl stored in the DB before touching anything
+    local actual_siteurl
+    actual_siteurl="$(mysql_exec_db "$DB_NAME" -N -s -e \
+        "SELECT option_value FROM ${opts} WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
     info "URL migration: $OLD_URL  →  $NEW_URL"
+    if [[ -n "$actual_siteurl" && "$actual_siteurl" != "$OLD_URL" ]]; then
+        warn "⚠  Mismatch — actual siteurl in DB is: $actual_siteurl"
+        warn "   Replacing against that URL instead of the one you entered."
+        OLD_URL="$actual_siteurl"
+        old_esc="$(sql_escape_literal "$OLD_URL")"
+        info "URL migration (corrected): $OLD_URL  →  $NEW_URL"
+    fi
 
     rows="$(mysql_exec_db "$DB_NAME" -N -s -e "
         UPDATE ${opts} SET option_value = REPLACE(option_value,'${old_esc}','${new_esc}')
@@ -867,6 +890,18 @@ _db_migrate_urls() {
         SELECT ROW_COUNT();
     " | tail -n1)"
     info "  options (home/siteurl) : ${rows:-0} row(s)"
+
+    if [[ "${rows:-0}" -eq 0 ]]; then
+        local current_siteurl current_home
+        current_siteurl="$(mysql_exec_db "$DB_NAME" -N -s -e \
+            "SELECT option_value FROM ${opts} WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
+        current_home="$(mysql_exec_db "$DB_NAME" -N -s -e \
+            "SELECT option_value FROM ${opts} WHERE option_name='home' LIMIT 1;" 2>/dev/null)"
+        warn "siteurl/home were NOT updated — current values:"
+        warn "  siteurl = ${current_siteurl:-(empty)}"
+        warn "  home    = ${current_home:-(empty)}"
+        warn "Run manually: UPDATE ${opts} SET option_value=REPLACE(option_value,'<old>','${NEW_URL}') WHERE option_name IN ('home','siteurl');"
+    fi
 
     rows="$(mysql_exec_db "$DB_NAME" -N -s -e "
         UPDATE ${posts} SET guid = REPLACE(guid,'${old_esc}','${new_esc}')
