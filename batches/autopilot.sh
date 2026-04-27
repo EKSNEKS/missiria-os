@@ -41,7 +41,8 @@ SRC_DB=""           # COPY only
 
 DB_NAME=""
 DB_DUMP=""          # NEW only: optional import dump
-WP_PREFIX=""        # COPY only: detected after clone
+WP_OLD_PREFIX=""    # COPY only: detected from source after clone
+WP_PREFIX=""        # COPY only: new prefix chosen by user
 OLD_URL=""          # COPY only
 NEW_URL=""          # COPY only
 GIT_REPO_URL=""     # COPY only: new git remote origin URL
@@ -345,6 +346,85 @@ check_mysql_health() {
     fi
 }
 
+intake_edit_loop() {
+    local edit_choice
+    while true; do
+        echo ""
+        printf '%b\n' "  ${CYAN}── EDIT SETTINGS ─────────────────────────────────────${NC}"
+        printf '%b\n' "  ${BOLD}[1]${NC}  Domain       : $DOMAIN"
+        printf '%b\n' "  ${BOLD}[2]${NC}  Web root     : $WEB_ROOT"
+        printf '%b\n' "  ${BOLD}[3]${NC}  Database     : $DB_NAME"
+        if [[ "$MODE" == "new" ]]; then
+            printf '%b\n' "  ${BOLD}[4]${NC}  DB dump      : ${DB_DUMP:-(none)}"
+        fi
+        printf '%b\n' "  ${BOLD}[5]${NC}  Email prefix : $EMAIL_PREFIX  →  ${EMAIL_PREFIX}@${DOMAIN}"
+        printf '%b\n' "  ${BOLD}[6]${NC}  Varnish      : ${ENABLE_VARNISH}"
+        printf '%b\n' "  ${BOLD}[7]${NC}  PHP version  : $PHP_VER"
+        printf '%b\n' "  ${BOLD}[8]${NC}  Skip Certbot : $SKIP_CERTBOT"
+        if [[ "$MODE" == "copy" ]]; then
+            printf '%b\n' "  ${BOLD}[9]${NC}  Source domain: $SRC_DOMAIN"
+            printf '%b\n' " ${BOLD}[10]${NC}  Source root  : $SRC_WEB_ROOT"
+            printf '%b\n' " ${BOLD}[11]${NC}  Source DB    : $SRC_DB"
+            printf '%b\n' " ${BOLD}[12]${NC}  Old URL      : $OLD_URL"
+            printf '%b\n' " ${BOLD}[13]${NC}  New URL      : $NEW_URL"
+            printf '%b\n' " ${BOLD}[14]${NC}  Git remote   : ${GIT_REPO_URL:-(unchanged)}"
+        fi
+        printf '%b\n' "  ${BOLD}[0]${NC}  Done — go back to summary"
+        echo ""
+        ask "Edit which setting? [0 to finish]:"
+        read -r edit_choice
+
+        case "$edit_choice" in
+            0) break ;;
+            1)
+                ask "New domain:"
+                read -r DOMAIN
+                DOMAIN="${DOMAIN#www.}"
+                DOMAIN="${DOMAIN%/}"
+                local site_clean; site_clean="$(echo "$(echo "$DOMAIN" | cut -d'.' -f1)" | tr '-' '_')"
+                EMAIL_FULL_USER="${EMAIL_PREFIX}_${site_clean}"
+                ;;
+            2) ask "Web root:"; read -r WEB_ROOT ;;
+            3)
+                ask "Database name:"
+                read -r DB_NAME
+                DB_NAME="$(echo "$DB_NAME" | tr '.-' '_')"
+                ;;
+            4)
+                [[ "$MODE" == "new" ]] || { warn "Option 4 is only for NEW mode."; continue; }
+                ask "SQL dump file (blank = empty DB):"
+                read -r DB_DUMP
+                ;;
+            5)
+                ask "Email prefix:"
+                read -r EMAIL_PREFIX
+                EMAIL_PREFIX="${EMAIL_PREFIX:-contact}"
+                local site_n; site_n="$(echo "$DOMAIN" | cut -d'.' -f1)"
+                EMAIL_FULL_USER="${EMAIL_PREFIX}_$(echo "$site_n" | tr '-' '_')"
+                info "Will create: ${EMAIL_PREFIX}@${DOMAIN}  →  system user: ${EMAIL_FULL_USER}"
+                ;;
+            6)
+                ask "Enable Varnish? [y/N]:"
+                read -r ENABLE_VARNISH
+                ENABLE_VARNISH="${ENABLE_VARNISH:-n}"
+                ;;
+            7) ask "PHP version [8.3]:"; read -r PHP_VER; PHP_VER="${PHP_VER:-8.3}" ;;
+            8)
+                ask "Skip Certbot? [y/N]:"
+                read -r SKIP_CERTBOT
+                SKIP_CERTBOT="${SKIP_CERTBOT:-n}"
+                ;;
+            9)  [[ "$MODE" == "copy" ]] && { ask "Source domain:"; read -r SRC_DOMAIN; } || warn "COPY mode only." ;;
+            10) [[ "$MODE" == "copy" ]] && { ask "Source root:"; read -r SRC_WEB_ROOT; } || warn "COPY mode only." ;;
+            11) [[ "$MODE" == "copy" ]] && { ask "Source database:"; read -r SRC_DB; } || warn "COPY mode only." ;;
+            12) [[ "$MODE" == "copy" ]] && { ask "Old URL:"; read -r OLD_URL; } || warn "COPY mode only." ;;
+            13) [[ "$MODE" == "copy" ]] && { ask "New URL:"; read -r NEW_URL; } || warn "COPY mode only." ;;
+            14) [[ "$MODE" == "copy" ]] && { ask "Git remote URL (blank = skip):"; read -r GIT_REPO_URL; } || warn "COPY mode only." ;;
+            *) warn "Invalid option." ;;
+        esac
+    done
+}
+
 print_summary() {
     echo ""
     printf '%b\n' "${BLUE}════════════════════════════════════════════════════════════${NC}"
@@ -367,7 +447,13 @@ print_summary() {
     [[ "$MODE" == "new" && -n "$DB_DUMP" ]] && printf '    DB dump       : %s\n' "$DB_DUMP"
     if [[ "$MODE" == "copy" ]]; then
         printf '    URL migrate   : %s  →  %s\n' "$OLD_URL" "$NEW_URL"
-        printf '    WP prefix     : %s\n' "(auto-detect after clone)"
+        if [[ -n "$WP_OLD_PREFIX" && -n "$WP_PREFIX" && "$WP_OLD_PREFIX" != "$WP_PREFIX" ]]; then
+            printf '    WP prefix     : %s  →  %s\n' "$WP_OLD_PREFIX" "$WP_PREFIX"
+        elif [[ -n "$WP_PREFIX" ]]; then
+            printf '    WP prefix     : %s\n' "$WP_PREFIX"
+        else
+            printf '    WP prefix     : %s\n' "(auto-detect after clone)"
+        fi
         if [[ -n "$GIT_REPO_URL" ]]; then
             printf '    Git remote    : %s\n' "$GIT_REPO_URL"
         else
@@ -484,8 +570,24 @@ exec_nginx() {
         systemctl reload nginx
         ok "Nginx reloaded — $DOMAIN live on HTTP."
     else
-        fail "Nginx config test FAILED — removing symlink."
-        rm -f "$enabled"
+        # If failure is caused by a missing SSL cert (copied from source before certbot ran),
+        # fall back to a plain HTTP config so certbot can complete the ACME challenge.
+        if nginx -t 2>&1 | grep -q 'cannot load certificate'; then
+            warn "SSL cert not found — writing temporary HTTP config so Certbot can run..."
+            cp "$avail" "${avail}.ssl-backup"
+            _nginx_write_new "$avail"
+            if nginx -t 2>&1; then
+                systemctl reload nginx
+                ok "Temporary HTTP config loaded — Certbot will upgrade to HTTPS."
+                info "SSL backup saved at: ${avail}.ssl-backup"
+            else
+                fail "Nginx config test FAILED even with HTTP config — removing symlink."
+                rm -f "$enabled"
+            fi
+        else
+            fail "Nginx config test FAILED — removing symlink. Fix it in sites-available and re-run."
+            rm -f "$enabled"
+        fi
     fi
 }
 
@@ -631,6 +733,7 @@ EOF
 
     if [[ -n "$OLD_URL" && -n "$NEW_URL" ]]; then
         _pick_wp_prefix
+        _rename_wp_prefix
         _db_migrate_urls
     else
         warn "URL migration skipped (no URLs provided)."
@@ -649,42 +752,103 @@ _pick_wp_prefix() {
          WHERE TABLE_SCHEMA='${db_esc}' AND TABLE_NAME LIKE '%options'
          ORDER BY TABLE_NAME;" 2>/dev/null)
 
+    # ── Step 1: identify the OLD (source) prefix ─────────────
     if (( ${#detected[@]} == 0 )); then
-        warn "No '*_options' table found — cannot auto-detect prefix."
+        warn "No '*_options' table found — cannot auto-detect source prefix."
+        WP_OLD_PREFIX="wp_"
+    elif (( ${#detected[@]} == 1 )); then
+        WP_OLD_PREFIX="${detected[0]}"
+        info "Source prefix detected: ${WP_OLD_PREFIX}"
     else
         echo ""
-        printf '%b\n' "  ${CYAN}Prefixes found in '$DB_NAME':${NC}"
+        printf '%b\n' "  ${CYAN}Multiple prefixes found in source DB '$DB_NAME':${NC}"
         for i in "${!detected[@]}"; do
             printf '%b\n' "    ${BLUE}[$((i+1))]${NC} ${detected[$i]}"
         done
         echo ""
-
-        if (( ${#detected[@]} == 1 )); then
-            ask "Use detected prefix '${detected[0]}'? [Y/n]:"
-            read -r _ans
-            if [[ "${_ans,,}" != "n" ]]; then
-                WP_PREFIX="${detected[0]}"
-                ok "WP prefix set to: $WP_PREFIX"
-                return
-            fi
-        else
-            ask "Select prefix number (or press Enter to type custom):"
-            read -r _pick
-            if [[ "$_pick" =~ ^[0-9]+$ ]]; then
-                local idx=$(( _pick - 1 ))
-                if (( idx >= 0 && idx < ${#detected[@]} )); then
-                    WP_PREFIX="${detected[$idx]}"
-                    ok "WP prefix set to: $WP_PREFIX"
-                    return
-                fi
+        ask "Select source prefix number (or press Enter to type manually):"
+        read -r _pick
+        if [[ "$_pick" =~ ^[0-9]+$ ]]; then
+            local idx=$(( _pick - 1 ))
+            if (( idx >= 0 && idx < ${#detected[@]} )); then
+                WP_OLD_PREFIX="${detected[$idx]}"
             fi
         fi
+        if [[ -z "$WP_OLD_PREFIX" ]]; then
+            ask "Source prefix (e.g., wp_):"
+            read -r WP_OLD_PREFIX
+            WP_OLD_PREFIX="${WP_OLD_PREFIX:-wp_}"
+        fi
+        info "Source prefix: $WP_OLD_PREFIX"
     fi
 
-    ask "Enter WordPress table prefix manually (e.g., wp_):"
-    read -r WP_PREFIX
-    WP_PREFIX="${WP_PREFIX:-wp_}"
-    ok "WP prefix set to: $WP_PREFIX"
+    # ── Step 2: ask for a NEW prefix for the cloned site ─────
+    echo ""
+    printf '%b\n' "  ${YELLOW}The source tables use prefix: ${BOLD}${WP_OLD_PREFIX}${NC}"
+    ask "New prefix for '$DB_NAME' (leave blank to keep '${WP_OLD_PREFIX}'):"
+    read -r _new_prefix
+    WP_PREFIX="${_new_prefix:-$WP_OLD_PREFIX}"
+    ok "New WP prefix: $WP_PREFIX"
+}
+
+_rename_wp_prefix() {
+    [[ "$WP_OLD_PREFIX" == "$WP_PREFIX" ]] && return
+
+    info "Renaming tables: '${WP_OLD_PREFIX}*' → '${WP_PREFIX}*' in '$DB_NAME' ..."
+    local db_esc; db_esc="$(sql_escape_literal "$DB_NAME")"
+    local old_esc; old_esc="$(sql_escape_literal "${WP_OLD_PREFIX}%")"
+
+    local -a tables=()
+    while IFS= read -r tbl; do
+        [[ -n "$tbl" ]] && tables+=("$tbl")
+    done < <(mysql_exec_db "$DB_NAME" -N -s -e \
+        "SELECT TABLE_NAME FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA='${db_esc}' AND TABLE_NAME LIKE '${old_esc}'
+         ORDER BY TABLE_NAME;" 2>/dev/null)
+
+    if (( ${#tables[@]} == 0 )); then
+        warn "No tables found with prefix '${WP_OLD_PREFIX}' — nothing renamed."
+        return
+    fi
+
+    local failed=0
+    for tbl in "${tables[@]}"; do
+        local new_tbl="${WP_PREFIX}${tbl#$WP_OLD_PREFIX}"
+        if mysql_exec_db "$DB_NAME" -e "RENAME TABLE \`${tbl}\` TO \`${new_tbl}\`;" 2>/dev/null; then
+            info "  Renamed: $tbl → $new_tbl"
+        else
+            warn "  Failed : $tbl"
+            (( failed++ ))
+        fi
+    done
+
+    # Update prefix-namespaced option_name keys (e.g. wp_user_roles)
+    local opts_quoted; opts_quoted="$(quote_identifier "${WP_PREFIX}options")"
+    local old_sql; old_sql="$(sql_escape_literal "$WP_OLD_PREFIX")"
+    local new_sql; new_sql="$(sql_escape_literal "$WP_PREFIX")"
+    mysql_exec_db "$DB_NAME" -e "
+        UPDATE ${opts_quoted}
+        SET option_name = CONCAT('${new_sql}', SUBSTR(option_name, LENGTH('${old_sql}') + 1))
+        WHERE option_name LIKE '${old_sql}%';
+    " 2>/dev/null && info "  options prefix keys updated." || warn "  options prefix update skipped."
+
+    # Update usermeta meta_key prefix references
+    local usermeta_quoted; usermeta_quoted="$(quote_identifier "${WP_PREFIX}usermeta")"
+    mysql_exec_db "$DB_NAME" -e "
+        UPDATE ${usermeta_quoted}
+        SET meta_key = CONCAT('${new_sql}', SUBSTR(meta_key, LENGTH('${old_sql}') + 1))
+        WHERE meta_key LIKE '${old_sql}%';
+    " 2>/dev/null && info "  usermeta meta_key prefix updated." || warn "  usermeta prefix update skipped."
+
+    (( failed == 0 )) && ok "All tables renamed: '${WP_OLD_PREFIX}' → '${WP_PREFIX}'" \
+                       || warn "${failed} table(s) failed to rename — check manually."
+
+    # Update wp-config.php table_prefix
+    local wp_config="$WEB_ROOT/wp-config.php"
+    if [[ -f "$wp_config" ]]; then
+        sed -i "s/\(\\\$table_prefix[[:space:]]*=[[:space:]]*'\)[^']*'/\1${WP_PREFIX}'/" "$wp_config"
+        ok "wp-config.php \$table_prefix updated to '${WP_PREFIX}'."
+    fi
 }
 
 _db_migrate_urls() {
@@ -1036,13 +1200,20 @@ main() {
     intake_options
     intake_mysql_admin
 
-    # ── SUMMARY & CONFIRM ─────────────────────────────────────
-    print_summary
-
-    if ! confirm "Launch now? All steps will run without further prompts."; then
-        echo "  Cancelled."
-        exit 0
-    fi
+    # ── SUMMARY, EDIT & CONFIRM ───────────────────────────────
+    while true; do
+        print_summary
+        echo ""
+        printf '%b\n' "  ${BOLD}[E]${NC}dit a setting   ${BOLD}[L]${NC}aunch now   ${BOLD}[Q]${NC}uit"
+        ask "Choice [E/L/Q]:"
+        read -r _launch_choice
+        case "${_launch_choice,,}" in
+            e|edit)  intake_edit_loop ;;
+            l|launch) break ;;
+            q|quit)  echo "  Cancelled."; exit 0 ;;
+            *)       warn "Type E to edit, L to launch, or Q to quit." ;;
+        esac
+    done
 
     # ── PHASE 2: EXECUTION ───────────────────────────────────
     echo ""
