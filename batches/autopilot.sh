@@ -567,6 +567,7 @@ exec_nginx() {
                 -e "s|server_name [^;]*;|server_name $DOMAIN www.$DOMAIN;|g" \
                 -e "s|root [^;]*;|root $WEB_ROOT;|g" \
                 -e "s|/etc/letsencrypt/live/${SRC_DOMAIN}/|/etc/letsencrypt/live/${DOMAIN}/|g" \
+                -e "s|/var/log/nginx/${SRC_DOMAIN}|/var/log/nginx/${DOMAIN}|g" \
                 "$src_conf" > "$avail"
             ok "Config copied and adapted from $SRC_DOMAIN."
         else
