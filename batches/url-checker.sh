@@ -46,7 +46,8 @@ check_status() {
         "http://127.0.0.1:8080${path}" 2>/dev/null
 }
 
-# ── Extract all href / src paths from HTML (internal only) ───────────────────
+# ── Extract all href / src paths from HTML (internal paths only) ─────────────
+# External links (different domain, tel:, mailto:, wa.me, etc.) are excluded.
 extract_links() {
     local html="$1" domain="$2"
     echo "$html" | grep -oE \
@@ -54,9 +55,21 @@ extract_links() {
         | grep -oE "((https?://(www\.)?${domain//./\\.})?/[^'\"#?][^'\"]*)" \
         | sed "s|https\?://\(www\.\)\?${domain//./\\.}||" \
         | grep -E "^/" \
+        | grep -vE "^//[^/]" \
         | grep -vE "\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff|woff2|ttf|eot|pdf|zip|xml|txt|mp4|m4v|map)(\?.*)?$" \
         | grep -vE "^/(wp-content|wp-includes|wp-admin|webmail)" \
         | sort -u
+}
+
+# ── Classify a broken path — returns hint string if special ───────────────────
+path_hint() {
+    local path="$1"
+    # Digit-only path = phone number stored without scheme (e.g. should be https://wa.me/XXXXXX)
+    if [[ "$path" =~ ^/([0-9]{7,15})$ ]]; then
+        echo "PHONE:${BASH_REMATCH[1]}"
+    else
+        echo ""
+    fi
 }
 
 # ── Parse sitemap (index + sub-sitemaps) → list of paths ─────────────────────
@@ -205,6 +218,13 @@ if [ "$MODE" == "2" ]; then
     echo -e "  Total unique URLs to check: ${BOLD}$(wc -l < "$QUEUE_FILE")${NC}"
 fi
 
+# ── Extract DB credentials once (from wp-config.php) ─────────────────────────
+DB_NAME=$(grep "DB_NAME"     "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tail -1 | tr -d "'")
+DB_USER=$(grep "DB_USER"     "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tail -1 | tr -d "'")
+DB_PASS=$(grep "DB_PASSWORD" "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tail -1 | tr -d "'")
+DB_HOST=$(grep "DB_HOST"     "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tail -1 | tr -d "'")
+PREFIX=$(grep  "table_prefix" "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tr -d "'")
+
 # ── Check each URL ────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}Step 3/3 — Checking HTTP status of all URLs...${NC}"
@@ -213,9 +233,6 @@ echo ""
 TOTAL_URLS=$(sort -u "$QUEUE_FILE" | grep -c "." || true)
 CHECKED=0
 BROKEN_COUNT=0
-
-# Track referrers: for each broken URL, which sitemap page is it from
-declare -A REFERRERS
 
 while IFS= read -r path; do
     [ -z "$path" ] && continue
@@ -226,18 +243,21 @@ while IFS= read -r path; do
 
     if [[ "$STATUS" == "404" || "$STATUS" == "000" || "$STATUS" == "410" ]]; then
         ((BROKEN_COUNT++))
-        # Find which pages reference this URL (search in DB post_content + meta)
-        DB_NAME=$(grep "DB_NAME" "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tail -1 | tr -d "'")
-        PREFIX=$(grep "table_prefix" "${ROOT}/wp-config.php" | grep -o "'[^']*'" | tr -d "'")
+        # Find which published posts link to this broken URL; return ID:slug pairs
         FULL_URL="https://www.${DOMAIN}${path}"
         SAFE=$(printf '%s' "$path" | sed "s/'/\\\\'/g; s/%/%%/g")
-        REFERRER_IDS=$(mysql -u"$DB_USER" -p"$DB_PASS" -h"$DB_HOST" "$DB_NAME" -se \
-            "SELECT GROUP_CONCAT(DISTINCT ID ORDER BY ID SEPARATOR ', ')
+        # Search for the path only inside href/src/action attributes to avoid
+        # false positives (e.g. wa.me/212661377106 matching search for /212661377106)
+        REFERRER_SLUGS=$(mysql -u"$DB_USER" -p"$DB_PASS" -h"$DB_HOST" "$DB_NAME" -se \
+            "SELECT GROUP_CONCAT(DISTINCT CONCAT(ID, ':', post_name) ORDER BY ID SEPARATOR ' | ')
              FROM ${PREFIX}posts
              WHERE post_status='publish'
-               AND (post_content LIKE '%${SAFE}%' OR post_content LIKE '%${FULL_URL//\//\\/}%')
-             LIMIT 1;" 2>/dev/null || echo "?")
-        printf '%s\t%s\t%s\n' "$path" "$STATUS" "${REFERRER_IDS:-not_in_db}" >> "$BROKEN_FILE"
+               AND (post_content LIKE '%href=\"${SAFE}\"%'
+                    OR post_content LIKE \"%href='${SAFE}'%\"
+                    OR post_content LIKE '%href=\"${FULL_URL//\//\\/}\"%'
+                    OR post_content LIKE \"%href='${FULL_URL//\//\\/}'%\")
+             LIMIT 1;" 2>/dev/null)
+        printf '%s\t%s\t%s\n' "$path" "$STATUS" "${REFERRER_SLUGS:-not_found_in_db}" >> "$BROKEN_FILE"
     fi
 done < <(sort -u "$QUEUE_FILE")
 
@@ -255,15 +275,38 @@ echo ""
 
 if [ "$BROKEN_COUNT" -gt 0 ]; then
     echo -e "${RED}${BOLD}Broken URLs:${NC}\n"
-    printf "  ${BOLD}%-60s  %-6s  %s${NC}\n" "URL PATH" "STATUS" "POST IDs (content references)"
-    printf '  %s\n' "$(printf '%.0s─' {1..90})"
+    printf "  ${BOLD}%-55s  %-6s  %s${NC}\n" "BROKEN URL PATH" "STATUS" "FOUND IN (id:slug  →  /wp-admin/post.php?post=ID&action=edit)"
+    printf '  %s\n' "$(printf '%.0s─' {1..110})"
 
-    while IFS=$'\t' read -r path status post_ids; do
+    while IFS=$'\t' read -r path status post_refs; do
         STATUS_COLOR="$YELLOW"
         [[ "$status" == "404" ]] && STATUS_COLOR="$RED"
         [[ "$status" == "000" ]] && STATUS_COLOR="$RED"
-        printf "  ${RED}%-60s${NC}  ${STATUS_COLOR}%-6s${NC}  ${BLUE}%s${NC}\n" \
-            "$path" "$status" "$post_ids"
+        # Build admin edit hints from "42:slug | 55:other" format
+        EDIT_HINTS=""
+        if [[ "$post_refs" != "not_found_in_db" && -n "$post_refs" ]]; then
+            while IFS='|' read -ra PAIRS; do
+                for pair in "${PAIRS[@]}"; do
+                    pair="${pair// /}"
+                    id="${pair%%:*}"
+                    slug="${pair##*:}"
+                    [[ -n "$id" && "$id" =~ ^[0-9]+$ ]] && \
+                        EDIT_HINTS+="${id}:${slug} → /wp-admin/post.php?post=${id}&action=edit  "
+                done
+            done <<< "$post_refs"
+        else
+            EDIT_HINTS="$post_refs"
+        fi
+        printf "  ${RED}%-55s${NC}  ${STATUS_COLOR}%-6s${NC}  ${BLUE}%s${NC}\n" \
+            "$path" "$status" "$EDIT_HINTS"
+        # Warn when path is a bare phone number — stored without scheme in post content
+        hint=$(path_hint "$path")
+        if [[ "$hint" == PHONE:* ]]; then
+            digits="${hint#PHONE:}"
+            printf "  ${YELLOW}  ↳ External link stored as internal path. Fix in post content:${NC}\n"
+            printf "  ${YELLOW}    href=\"/%-*s${NC}${YELLOW}\" → href=\"https://wa.me/%s\"${NC}\n" \
+                "${#digits}" "$digits" "$digits"
+        fi
     done < "$BROKEN_FILE"
 
     echo ""
@@ -276,9 +319,30 @@ if [ "$BROKEN_COUNT" -gt 0 ]; then
         echo "Checked : ${CHECKED} URLs"
         echo "Broken  : ${BROKEN_COUNT}"
         echo ""
-        printf '%-80s\t%-6s\t%s\n' "URL" "STATUS" "POST_IDs_in_content"
-        while IFS=$'\t' read -r path status post_ids; do
-            printf '%-80s\t%-6s\t%s\n' "$path" "$status" "$post_ids"
+        printf '%-80s\t%-6s\t%-30s\t%s\n' "BROKEN_URL" "STATUS" "POST_ID:SLUG" "ADMIN_EDIT_URL"
+        while IFS=$'\t' read -r path status post_refs; do
+            file_hint=""
+            fh=$(path_hint "$path")
+            if [[ "$fh" == PHONE:* ]]; then
+                file_hint="  ⚠ Phone/WA number stored as internal path — fix: href=\"https://wa.me/${fh#PHONE:}\""
+            fi
+            if [[ "$post_refs" != "not_found_in_db" && -n "$post_refs" ]]; then
+                while IFS='|' read -ra PAIRS; do
+                    for pair in "${PAIRS[@]}"; do
+                        pair="${pair// /}"
+                        id="${pair%%:*}"
+                        slug="${pair##*:}"
+                        if [[ -n "$id" && "$id" =~ ^[0-9]+$ ]]; then
+                            printf '%-80s\t%-6s\t%-30s\t%s%s\n' \
+                                "$path" "$status" "${id}:${slug}" \
+                                "https://www.${DOMAIN}/wp-admin/post.php?post=${id}&action=edit" \
+                                "$file_hint"
+                        fi
+                    done
+                done <<< "$post_refs"
+            else
+                printf '%-80s\t%-6s\t%-30s\t%s\n' "$path" "$status" "not_found_in_db" "$file_hint"
+            fi
         done < "$BROKEN_FILE"
     } > "$REPORT"
 

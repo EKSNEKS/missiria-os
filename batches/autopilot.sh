@@ -49,6 +49,7 @@ GIT_REPO_URL=""     # COPY only: new git remote origin URL
 
 EMAIL_PREFIX="contact"
 EMAIL_FULL_USER=""
+EMAIL_PASSWORD=""
 
 ENABLE_VARNISH="n"
 PHP_VER="8.3"
@@ -282,20 +283,40 @@ intake_email() {
     EMAIL_FULL_USER="${EMAIL_PREFIX}_${site_clean}"
 
     info "Will create: ${EMAIL_PREFIX}@${DOMAIN}  →  system user: ${EMAIL_FULL_USER}"
+
+    local pass1 pass2
+    while true; do
+        printf '%b' "  ${YELLOW}▶ Password for ${EMAIL_PREFIX}@${DOMAIN}: ${NC}"
+        read -r -s pass1; printf '\n'
+        [[ -z "$pass1" ]] && { warn "Password cannot be empty."; continue; }
+        printf '%b' "  ${YELLOW}▶ Confirm password: ${NC}"
+        read -r -s pass2; printf '\n'
+        [[ "$pass1" != "$pass2" ]] && { warn "Passwords do not match — try again."; continue; }
+        EMAIL_PASSWORD="$pass1"
+        ok "Email password set."
+        break
+    done
 }
 
 intake_options() {
     echo ""
     printf '%b\n' "  ${CYAN}── OPTIONS ───────────────────────────────────────────${NC}"
 
+    # Detect available PHP-FPM versions for display
+    local _avail_php=()
+    for _s in /var/run/php/php*-fpm.sock; do
+        [[ -S "$_s" ]] && _avail_php+=("$(basename "$_s" | sed 's/php\(.*\)-fpm.sock/\1/')")
+    done
+    local _php_hint=""
+    (( ${#_avail_php[@]} > 0 )) && _php_hint=" (available: ${_avail_php[*]})"
+    ask "PHP version [8.3]${_php_hint}:"
+    read -r PHP_VER
+    PHP_VER="${PHP_VER:-8.3}"
+    info "PHP version: $PHP_VER"
+
     ask "Enable Varnish cache? [y/N]:"
     read -r ENABLE_VARNISH
     ENABLE_VARNISH="${ENABLE_VARNISH:-n}"
-    if [[ "${ENABLE_VARNISH,,}" == "y" ]]; then
-        ask "PHP version for Nginx backend [8.3]:"
-        read -r PHP_VER
-        PHP_VER="${PHP_VER:-8.3}"
-    fi
 
     ask "Skip Certbot SSL? (useful for local/dev) [y/N]:"
     read -r SKIP_CERTBOT
@@ -414,6 +435,18 @@ intake_edit_loop() {
                 local site_n; site_n="$(echo "$DOMAIN" | cut -d'.' -f1)"
                 EMAIL_FULL_USER="${EMAIL_PREFIX}_$(echo "$site_n" | tr '-' '_')"
                 info "Will create: ${EMAIL_PREFIX}@${DOMAIN}  →  system user: ${EMAIL_FULL_USER}"
+                local _ep1 _ep2
+                while true; do
+                    printf '%b' "  ${YELLOW}▶ New password for ${EMAIL_PREFIX}@${DOMAIN}: ${NC}"
+                    read -r -s _ep1; printf '\n'
+                    [[ -z "$_ep1" ]] && { warn "Password cannot be empty."; continue; }
+                    printf '%b' "  ${YELLOW}▶ Confirm password: ${NC}"
+                    read -r -s _ep2; printf '\n'
+                    [[ "$_ep1" != "$_ep2" ]] && { warn "Passwords do not match."; continue; }
+                    EMAIL_PASSWORD="$_ep1"
+                    ok "Email password updated."
+                    break
+                done
                 ;;
             6)
                 ask "Enable Varnish? [y/N]:"
@@ -608,6 +641,26 @@ exec_nginx() {
 _nginx_write_new() {
     local avail="$1"
     [[ -f "$avail" ]] && warn "Config already exists — overwriting."
+
+    # Resolve PHP-FPM socket: prefer $PHP_VER, fall back to whatever is running
+    local fpm_sock=""
+    local _try_ver="$PHP_VER"
+    if [[ -S "/var/run/php/php${_try_ver}-fpm.sock" ]]; then
+        fpm_sock="/var/run/php/php${_try_ver}-fpm.sock"
+    else
+        # Find first available socket from installed PHP-FPM versions
+        for _sock in /var/run/php/php*-fpm.sock; do
+            [[ -S "$_sock" ]] && fpm_sock="$_sock" && break
+        done
+    fi
+
+    if [[ -z "$fpm_sock" ]]; then
+        warn "No PHP-FPM socket found — defaulting to php${_try_ver}-fpm.sock (may need fixing)."
+        fpm_sock="/var/run/php/php${_try_ver}-fpm.sock"
+    else
+        info "PHP-FPM socket: $fpm_sock"
+    fi
+
     info "Writing: $avail"
     cat > "$avail" <<EOF
 server {
@@ -623,7 +676,7 @@ server {
 
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+        fastcgi_pass unix:${fpm_sock};
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         include fastcgi_params;
     }
@@ -633,7 +686,7 @@ server {
     }
 }
 EOF
-    ok "Nginx config written."
+    ok "Nginx config written (PHP-FPM: ${fpm_sock})."
 }
 
 _cleanup_certbot_injections() {
@@ -750,7 +803,7 @@ EOF
 
     if [[ -n "$DB_DUMP" && -f "$DB_DUMP" ]]; then
         info "Importing '$DB_DUMP' into '$DB_NAME' ..."
-        mysql_exec_db "$DB_NAME" < "$DB_DUMP" && ok "Import complete." || fail "Import failed."
+        mysql_admin_db "$DB_NAME" < "$DB_DUMP" && ok "Import complete." || fail "Import failed."
     elif [[ -n "$DB_DUMP" ]]; then
         warn "Dump file not found: $DB_DUMP — skipped."
     else
@@ -793,7 +846,7 @@ EOF
     fi
 
     info "Importing into '$DB_NAME' ..."
-    if mysql_exec_db "$DB_NAME" < "$tmp_dump"; then
+    if mysql_admin_db "$DB_NAME" < "$tmp_dump"; then
         ok "Clone complete!"
     else
         fail "Import failed."
@@ -1007,6 +1060,9 @@ exec_email() {
         fi
     fi
 
+    echo "$EMAIL_FULL_USER:$EMAIL_PASSWORD" | chpasswd
+    ok "Password set for $EMAIL_FULL_USER."
+
     if [[ ! -d "$maildir" ]]; then
         mkdir -p "$maildir"/{cur,new,tmp}
         ok "Maildir created: $maildir"
@@ -1025,6 +1081,104 @@ exec_email() {
     fi
 
     systemctl reload postfix && ok "Postfix reloaded." || warn "Postfix reload failed."
+
+    # ── SMTP constants in wp-config.php ──────────────────────────────
+    local wp_config="$WEB_ROOT/wp-config.php"
+    if [[ -f "$wp_config" ]]; then
+        local smtp_block
+        smtp_block="define('MISSIRIA_SMTP_USERNAME', '${EMAIL_FULL_USER}');
+define('MISSIRIA_SMTP_PASSWORD', '${EMAIL_PASSWORD}');
+define('MISSIRIA_SMTP_FROM_EMAIL', '${email_addr}');
+define('MISSIRIA_SMTP_FROM_NAME', '$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')');
+"
+        if grep -q "MISSIRIA_SMTP_USERNAME" "$wp_config"; then
+            # Update existing block
+            sed -i \
+                -e "s|define('MISSIRIA_SMTP_USERNAME',[^)]*);|define('MISSIRIA_SMTP_USERNAME', '${EMAIL_FULL_USER}');|" \
+                -e "s|define('MISSIRIA_SMTP_PASSWORD',[^)]*);|define('MISSIRIA_SMTP_PASSWORD', '${EMAIL_PASSWORD}');|" \
+                -e "s|define('MISSIRIA_SMTP_FROM_EMAIL',[^)]*);|define('MISSIRIA_SMTP_FROM_EMAIL', '${email_addr}');|" \
+                -e "s|define('MISSIRIA_SMTP_FROM_NAME',[^)]*);|define('MISSIRIA_SMTP_FROM_NAME', '$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')');|" \
+                "$wp_config"
+            ok "wp-config.php SMTP constants updated."
+        else
+            # Inject after opening <?php tag
+            local tmp="${wp_config}.smtp.tmp"
+            awk -v block="$smtp_block" '
+                /^<\?php/ && !done { print; print ""; printf "%s", block; done=1; next }
+                1
+            ' "$wp_config" > "$tmp" && mv "$tmp" "$wp_config"
+            chown www-data:www-data "$wp_config"
+            ok "wp-config.php SMTP constants injected."
+        fi
+    else
+        info "wp-config.php not found at $WEB_ROOT — SMTP constants skipped."
+    fi
+
+    # ── Dovecot virtual user (lets iOS/Outlook login with full email) ──
+    if command -v dovecot &>/dev/null || systemctl list-units --type=service 2>/dev/null | grep -q dovecot; then
+        local dovecot_users="/etc/dovecot/users"
+        local dovecot_auth_conf="/etc/dovecot/conf.d/10-auth.conf"
+        local dovecot_passfile_conf="/etc/dovecot/conf.d/auth-passwdfile.conf.ext"
+
+        # Create users file with correct ownership
+        if [[ ! -f "$dovecot_users" ]]; then
+            touch "$dovecot_users"
+            chmod 640 "$dovecot_users"
+            chown root:dovecot "$dovecot_users" 2>/dev/null || true
+        fi
+
+        # Hash the password
+        local hashed_pass
+        if command -v doveadm &>/dev/null; then
+            hashed_pass="$(doveadm pw -s SHA512-CRYPT -p "$EMAIL_PASSWORD" 2>/dev/null)"
+        else
+            hashed_pass="{SHA512-CRYPT}$(openssl passwd -6 "$EMAIL_PASSWORD" 2>/dev/null)"
+        fi
+
+        local uid gid
+        uid="$(id -u "$EMAIL_FULL_USER")"
+        gid="$(id -g "$EMAIL_FULL_USER")"
+
+        if grep -q "^${email_addr}:" "$dovecot_users" 2>/dev/null; then
+            sed -i "s|^${email_addr}:.*|${email_addr}:${hashed_pass}:${uid}:${gid}::/home/${EMAIL_FULL_USER}::|" "$dovecot_users"
+            ok "Dovecot user updated: $email_addr"
+        else
+            echo "${email_addr}:${hashed_pass}:${uid}:${gid}::/home/${EMAIL_FULL_USER}::" >> "$dovecot_users"
+            ok "Dovecot virtual user added: $email_addr → /home/${EMAIL_FULL_USER}"
+        fi
+
+        # Create passwd-file auth config if missing
+        if [[ ! -f "$dovecot_passfile_conf" ]]; then
+            cat > "$dovecot_passfile_conf" <<'DCONF'
+passdb {
+  driver = passwd-file
+  args = scheme=SHA512-CRYPT /etc/dovecot/users
+}
+userdb {
+  driver = passwd-file
+  args = /etc/dovecot/users
+  default_fields = home=/home/%n mail=maildir:~/Maildir
+}
+DCONF
+            ok "Dovecot auth-passwdfile.conf.ext created."
+        fi
+
+        # Enable !include in 10-auth.conf if not already active
+        if [[ -f "$dovecot_auth_conf" ]]; then
+            if grep -q "^#!include auth-passwdfile.conf.ext" "$dovecot_auth_conf"; then
+                sed -i 's|^#!include auth-passwdfile.conf.ext|!include auth-passwdfile.conf.ext|' "$dovecot_auth_conf"
+                ok "Dovecot auth-passwdfile enabled in 10-auth.conf."
+            elif ! grep -q "^!include auth-passwdfile.conf.ext" "$dovecot_auth_conf"; then
+                echo "!include auth-passwdfile.conf.ext" >> "$dovecot_auth_conf"
+                ok "Dovecot auth-passwdfile added to 10-auth.conf."
+            fi
+        fi
+
+        systemctl reload dovecot 2>/dev/null && ok "Dovecot reloaded — login with: $email_addr" \
+            || warn "Could not reload Dovecot — run: systemctl reload dovecot"
+    else
+        info "Dovecot not found — IMAP login will use system username: $EMAIL_FULL_USER"
+    fi
 }
 
 exec_varnish() {
