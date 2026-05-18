@@ -21,9 +21,20 @@ for CONFIG in $WP_CONFIGS; do
     # OPcache Buster: Generate a unique filename for this specific run
     TRIGGER_FILE="missiria-trigger-$RANDOM.php"
 
-    NGINX_CONF=$(grep -Rl "$SITE_PATH" /etc/nginx/sites-enabled/ 2>/dev/null | head -n 1)
+    # Use -R (follow symlinks in sites-enabled) and word-boundary pattern to avoid false
+    # prefix matches (e.g. eksit_is would otherwise match configs referencing eksit_ise).
+    # Count-based fastcgi_pass check avoids ugrep -q early-exit killing the subshell loop;
+    # it also skips PHP-disabled configs like static CDN subdomains sharing a docroot.
+    NGINX_CONF=$(grep -RlE "${SITE_PATH}[^a-zA-Z0-9_./-]" /etc/nginx/sites-enabled/ 2>/dev/null | while read -r f; do
+        [ "$(grep -c "fastcgi_pass" "$f" 2>/dev/null)" -gt 0 ] && echo "$f"
+    done | head -n 1)
     if [ -n "$NGINX_CONF" ]; then
-        DOMAIN=$(grep -E "^\s*server_name" "$NGINX_CONF" | head -n 1 | awk '{print $2}' | tr -d ';')
+        # Prefer www. variant: some sites have a plugin redirecting non-www→www during init,
+        # which silently breaks the trigger script when the WP home URL uses www.
+        DOMAIN=$(grep -E "^\s*server_name" "$NGINX_CONF" | head -n 1 | tr -d ';' | awk '{for(i=2;i<=NF;i++) print $i}' | tr ' ' '\n' | grep "^www\." | head -1)
+        if [ -z "$DOMAIN" ] || [ "$DOMAIN" == "_" ]; then
+            DOMAIN=$(grep -E "^\s*server_name" "$NGINX_CONF" | head -n 1 | awk '{print $2}' | tr -d ';')
+        fi
     fi
 
     if [ -z "$NGINX_CONF" ]; then
@@ -38,8 +49,8 @@ for CONFIG in $WP_CONFIGS; do
         continue
     fi
 
-    HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L -m 5 "http://$DOMAIN")
-    if [ "$HTTP_STATUS" -eq 000 ] || [ "$HTTP_STATUS" -ge 500 ]; then
+    HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" -k -H "Host: $DOMAIN" -m 5 "https://127.0.0.1/")
+    if [ "$HTTP_STATUS" -eq 000 ]; then
         DEAD_SITES+=("$DOMAIN | HTTP status $HTTP_STATUS")
         echo -e "${RED}[DEAD] $DOMAIN (Status: $HTTP_STATUS). Skipping.${NC}"
         continue
@@ -51,7 +62,7 @@ for CONFIG in $WP_CONFIGS; do
     # TRIGGER WP-CRON FOR MISSED SCHEDULED POSTS
     # ---------------------------------------------------------
     # Using -L to follow the HTTP -> HTTPS redirect in your Nginx config
-    CRON_HTTP=$(curl -o /dev/null -s -w "%{http_code}" -L -m 15 "http://$DOMAIN/wp-cron.php?doing_wp_cron")
+    CRON_HTTP=$(curl -o /dev/null -s -w "%{http_code}" -k -H "Host: $DOMAIN" -m 15 "https://127.0.0.1/wp-cron.php?doing_wp_cron")
     if [ "$CRON_HTTP" -eq 200 ]; then
         echo -e "${GREEN}✓ WP-Cron triggered (Schedules Published)${NC}"
     else
@@ -126,7 +137,7 @@ EOF
     chown www-data:www-data "$SITE_PATH/$TRIGGER_FILE"
 
     # Execute dynamic file
-    HTTP_RESP=$(curl -s -L -m 900 "http://$DOMAIN/$TRIGGER_FILE")
+    HTTP_RESP=$(curl -s -k -H "Host: $DOMAIN" -m 900 "https://127.0.0.1/$TRIGGER_FILE")
 
     SITE_END=$(date +%s)
     DURATION=$((SITE_END - SITE_START))
