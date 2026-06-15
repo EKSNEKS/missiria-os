@@ -16,6 +16,12 @@ RETRY_DELAY="${RETRY_DELAY:-10}"
 DRY_RUN="${DRY_RUN:-0}"
 RSYNC_DELETE="${RSYNC_DELETE:-0}"
 
+# ── Email notification ────────────────────────────────────────────────────────
+ADMIN_EMAIL="${ADMIN_EMAIL:-contact@eksneks.com}"
+NOTIFY_FROM="${NOTIFY_FROM:-contact@eksneks.com}"
+SENDMAIL_BIN="${SENDMAIL_BIN:-/usr/sbin/sendmail}"
+EMAIL_ENABLED="${EMAIL_ENABLED:-1}"
+
 # ── Runtime state ─────────────────────────────────────────────────────────────
 _SEND_MODE="latest"   # latest | all | run
 _SEND_RUN=""          # used when _SEND_MODE=run
@@ -243,19 +249,17 @@ load_password() {
 get_latest_run() {
     local run_dir
 
+    # Filter run dirs by the expected timestamp pattern BEFORE picking the
+    # latest, so unrelated entries like `manual/` (created by ad-hoc snapshots)
+    # don't sort after the timestamped runs and shadow them.
     run_dir="$(
-        find "$BACKUP_BASE_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null \
+        find "$BACKUP_BASE_DIR" -mindepth 1 -maxdepth 1 -type d \
+            -regextype posix-extended -regex '.*/[0-9]{8}_[0-9]{6}$' -print0 2>/dev/null \
         | sort -z | tail -z -n1 \
         | tr -d '\0'
     )"
 
     if [[ -z "$run_dir" ]]; then
-        return 1
-    fi
-
-    local run_name
-    run_name="$(basename "$run_dir")"
-    if [[ ! "$run_name" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
         return 1
     fi
 
@@ -505,14 +509,100 @@ resolve_target_servers() {
     done
 }
 
+# ── Email notification ────────────────────────────────────────────────────────
+send_email_report() {
+    local status="$1"       # ok | failed | aborted
+    local subject_tag="$2"
+    local body_text="$3"
+
+    [[ "$EMAIL_ENABLED" != "1" ]] && return 0
+    [[ -z "$ADMIN_EMAIL" ]] && return 0
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    if [[ ! -x "$SENDMAIL_BIN" ]]; then
+        log_warn "Email skipped: ${SENDMAIL_BIN} not executable."
+        return 0
+    fi
+
+    local hostname now icon
+    hostname="$(hostname -f 2>/dev/null || hostname)"
+    now="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+    case "$status" in
+        ok)      icon="✓" ;;
+        failed)  icon="✗" ;;
+        aborted) icon="⚠" ;;
+        *)       icon="•" ;;
+    esac
+
+    "$SENDMAIL_BIN" -f "$NOTIFY_FROM" "$ADMIN_EMAIL" <<EOF
+From: MISSIRIA Backup Sender <$NOTIFY_FROM>
+To: $ADMIN_EMAIL
+Subject: [Backup Sender] $icon ${subject_tag} — ${hostname}
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+========================================
+  MISSIRIA BACKUP SENDER
+========================================
+  Host    : ${hostname}
+  Status  : ${status}
+  Time    : ${now}
+========================================
+
+${body_text}
+
+--
+MISSIRIA Backup Sender
+EOF
+}
+
+build_report_body() {
+    local target_summary="$1"
+    local runs_summary="$2"
+    local total_time="$3"
+    local body=""
+
+    body+="Target servers : ${target_summary}\n"
+    body+="Backup runs    : ${runs_summary}\n"
+    body+="Total duration : ${total_time}s\n"
+    body+="\n"
+
+    if ((${#SENT_OK[@]} > 0)); then
+        body+="Successfully sent (${#SENT_OK[@]}):\n"
+        local item
+        for item in "${SENT_OK[@]}"; do
+            body+="  ✓ ${item}\n"
+        done
+        body+="\n"
+    fi
+
+    if ((${#SENT_FAILED[@]} > 0)); then
+        body+="Failed (${#SENT_FAILED[@]}):\n"
+        local item
+        for item in "${SENT_FAILED[@]}"; do
+            body+="  ✗ ${item}\n"
+        done
+        body+="\n"
+    fi
+
+    printf '%b' "$body"
+}
+
+abort_with_email() {
+    local reason="$1"
+    log_error "$reason"
+    send_email_report "aborted" "ABORTED" "$reason"
+    exit 1
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
     parse_args "$@"
     print_header
     printf '\n'
 
-    validate_deps || exit 1
-    load_server_configs || exit 1
+    validate_deps || abort_with_email "Missing required dependency (rsync or ssh) on $(hostname -f 2>/dev/null || hostname)."
+    load_server_configs || abort_with_email "Cannot load server config from ${SENDER_CONFIG}. Verify the file exists and has valid entries."
 
     if ((_DO_LIST)); then
         print_list
@@ -527,23 +617,20 @@ main() {
             local latest_run
             latest_run="$(get_latest_run || true)"
             if [[ -z "$latest_run" ]]; then
-                log_error "No backup runs found in ${BACKUP_BASE_DIR}."
-                exit 1
+                abort_with_email "No backup runs found in ${BACKUP_BASE_DIR}. Daily site-auto-backup.sh may have failed."
             fi
             runs_to_send=("$latest_run")
             ;;
         all)
             get_all_runs runs_to_send
             if ((${#runs_to_send[@]} == 0)); then
-                log_error "No backup runs found in ${BACKUP_BASE_DIR}."
-                exit 1
+                abort_with_email "No backup runs found in ${BACKUP_BASE_DIR}. Daily site-auto-backup.sh may have failed."
             fi
             ;;
         run)
             local specific_run="${BACKUP_BASE_DIR%/}/${_SEND_RUN}"
             if [[ ! -d "$specific_run" ]]; then
-                log_error "Backup run not found: ${specific_run}"
-                exit 1
+                abort_with_email "Backup run not found: ${specific_run}"
             fi
             runs_to_send=("$specific_run")
             ;;
@@ -551,7 +638,7 @@ main() {
 
     # ── Resolve target servers ────────────────────────────────────────────────
     local -a target_servers=()
-    resolve_target_servers target_servers || exit 1
+    resolve_target_servers target_servers || abort_with_email "Cannot resolve target server alias(es). Verify --server values against ${SENDER_CONFIG}."
 
     log_info "Runs to send:  ${#runs_to_send[@]}"
     log_info "Target servers: ${#target_servers[@]} ($(IFS=', '; printf '%s' "${target_servers[*]}"))"
@@ -605,8 +692,28 @@ main() {
         for item in "${SENT_FAILED[@]}"; do
             printf '  ✗ %s\n' "$item"
         done
+    fi
+
+    # ── Email report ──────────────────────────────────────────────────────────
+    local runs_count="${#runs_to_send[@]}"
+    local servers_csv runs_csv
+    servers_csv="$(IFS=', '; printf '%s' "${target_servers[*]}")"
+    runs_csv=""
+    local r
+    for r in "${runs_to_send[@]}"; do
+        runs_csv+="$(basename "$r") "
+    done
+    runs_csv="${runs_csv% }"
+
+    local report_body
+    report_body="$(build_report_body "${servers_csv}" "${runs_count} run(s): ${runs_csv}" "${total_time}")"
+
+    if ((${#SENT_FAILED[@]} > 0)); then
+        send_email_report "failed" "${#SENT_FAILED[@]} failed / ${#SENT_OK[@]} OK" "$report_body"
         exit 1
     fi
+
+    send_email_report "ok" "${#SENT_OK[@]} sent OK" "$report_body"
 }
 
 main "$@"
