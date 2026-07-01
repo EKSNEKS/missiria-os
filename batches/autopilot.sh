@@ -981,15 +981,10 @@ _rename_wp_prefix() {
 }
 
 _db_migrate_urls() {
-    local old_esc new_esc opts posts postmeta rows
-    old_esc="$(sql_escape_literal "$OLD_URL")"
-    new_esc="$(sql_escape_literal "$NEW_URL")"
+    local opts actual_siteurl helper php_bin
     opts="$(quote_identifier "${WP_PREFIX}options")"
-    posts="$(quote_identifier "${WP_PREFIX}posts")"
-    postmeta="$(quote_identifier "${WP_PREFIX}postmeta")"
 
-    # Show the actual siteurl stored in the DB before touching anything
-    local actual_siteurl
+    # Show the actual siteurl stored in the DB before touching anything.
     actual_siteurl="$(mysql_exec_db "$DB_NAME" -N -s -e \
         "SELECT option_value FROM ${opts} WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
     info "URL migration: $OLD_URL  →  $NEW_URL"
@@ -997,9 +992,69 @@ _db_migrate_urls() {
         warn "⚠  Mismatch — actual siteurl in DB is: $actual_siteurl"
         warn "   Replacing against that URL instead of the one you entered."
         OLD_URL="$actual_siteurl"
-        old_esc="$(sql_escape_literal "$OLD_URL")"
         info "URL migration (corrected): $OLD_URL  →  $NEW_URL"
     fi
+
+    helper="$(dirname "${BASH_SOURCE[0]}")/wp-url-migrate.php"
+    [[ -f "$helper" ]] || helper="/home/missiria/linux-terminal-tools/batches/wp-url-migrate.php"
+    if [[ ! -f "$helper" ]]; then
+        warn "wp-url-migrate.php helper not found — falling back to legacy REPLACE."
+        _db_migrate_urls_legacy
+        return
+    fi
+
+    php_bin="$(command -v php || true)"
+    if [[ -z "$php_bin" ]]; then
+        warn "php CLI not found — falling back to legacy REPLACE."
+        _db_migrate_urls_legacy
+        return
+    fi
+
+    # Build URL variants so all 4 schemes get migrated in one autopilot pass.
+    local -a variants=()
+    _push_variant() { local v="$1"; [[ -n "$v" ]] && variants+=("$v"); }
+    local old_host="${OLD_URL#http://}"; old_host="${old_host#https://}"; old_host="${old_host%/}"
+    _push_variant "https://${old_host}"
+    _push_variant "http://${old_host}"
+    if [[ "$old_host" == www.* ]]; then
+        _push_variant "https://${old_host#www.}"
+        _push_variant "http://${old_host#www.}"
+    else
+        _push_variant "https://www.${old_host}"
+        _push_variant "http://www.${old_host}"
+    fi
+
+    local mysql_user mysql_pass
+    mysql_user="${MYSQL_ADMIN_USER:-root}"
+    mysql_pass="${MYSQL_ADMIN_PASSWORD:-}"
+
+    local v rc=0
+    for v in "${variants[@]}"; do
+        [[ "$v" == "$NEW_URL" ]] && continue
+        "$php_bin" "$helper" \
+            --db="$DB_NAME" --prefix="$WP_PREFIX" \
+            --old="$v" --new="$NEW_URL" \
+            --user="$mysql_user" --pass="$mysql_pass" \
+            --host="${MYSQL_HOST:-localhost}" \
+            2>&1 | sed 's/^/    /'
+        rc=$((rc + $?))
+    done
+
+    if (( rc != 0 )); then
+        warn "URL migration helper reported errors — verify DB state manually."
+    fi
+    ok "URL migration complete."
+}
+
+# Legacy fallback — naive REPLACE, breaks serialized data. Kept only for
+# disaster recovery when the PHP helper or CLI is unavailable.
+_db_migrate_urls_legacy() {
+    local old_esc new_esc opts posts postmeta rows
+    old_esc="$(sql_escape_literal "$OLD_URL")"
+    new_esc="$(sql_escape_literal "$NEW_URL")"
+    opts="$(quote_identifier "${WP_PREFIX}options")"
+    posts="$(quote_identifier "${WP_PREFIX}posts")"
+    postmeta="$(quote_identifier "${WP_PREFIX}postmeta")"
 
     rows="$(mysql_exec_db "$DB_NAME" -N -s -e "
         UPDATE ${opts} SET option_value = REPLACE(option_value,'${old_esc}','${new_esc}')
@@ -1007,18 +1062,6 @@ _db_migrate_urls() {
         SELECT ROW_COUNT();
     " | tail -n1)"
     info "  options (home/siteurl) : ${rows:-0} row(s)"
-
-    if [[ "${rows:-0}" -eq 0 ]]; then
-        local current_siteurl current_home
-        current_siteurl="$(mysql_exec_db "$DB_NAME" -N -s -e \
-            "SELECT option_value FROM ${opts} WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
-        current_home="$(mysql_exec_db "$DB_NAME" -N -s -e \
-            "SELECT option_value FROM ${opts} WHERE option_name='home' LIMIT 1;" 2>/dev/null)"
-        warn "siteurl/home were NOT updated — current values:"
-        warn "  siteurl = ${current_siteurl:-(empty)}"
-        warn "  home    = ${current_home:-(empty)}"
-        warn "Run manually: UPDATE ${opts} SET option_value=REPLACE(option_value,'<old>','${NEW_URL}') WHERE option_name IN ('home','siteurl');"
-    fi
 
     rows="$(mysql_exec_db "$DB_NAME" -N -s -e "
         UPDATE ${posts} SET guid = REPLACE(guid,'${old_esc}','${new_esc}')
@@ -1041,8 +1084,6 @@ _db_migrate_urls() {
         SELECT ROW_COUNT();
     " | tail -n1)"
     info "  postmeta.meta_value    : ${rows:-0} row(s)"
-
-    ok "URL migration complete."
 }
 
 exec_email() {
@@ -1091,7 +1132,7 @@ exec_email() {
     local wp_config="$WEB_ROOT/wp-config.php"
     if [[ -f "$wp_config" ]]; then
         local smtp_block
-        smtp_block="define('MISSIRIA_SMTP_USERNAME', '${EMAIL_FULL_USER}');
+        smtp_block="define('MISSIRIA_SMTP_USERNAME', '${email_addr}');
 define('MISSIRIA_SMTP_PASSWORD', '${EMAIL_PASSWORD}');
 define('MISSIRIA_SMTP_FROM_EMAIL', '${email_addr}');
 define('MISSIRIA_SMTP_FROM_NAME', '$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')');
@@ -1099,7 +1140,7 @@ define('MISSIRIA_SMTP_FROM_NAME', '$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lowe
         if grep -q "MISSIRIA_SMTP_USERNAME" "$wp_config"; then
             # Update existing block
             sed -i \
-                -e "s|define('MISSIRIA_SMTP_USERNAME',[^)]*);|define('MISSIRIA_SMTP_USERNAME', '${EMAIL_FULL_USER}');|" \
+                -e "s|define('MISSIRIA_SMTP_USERNAME',[^)]*);|define('MISSIRIA_SMTP_USERNAME', '${email_addr}');|" \
                 -e "s|define('MISSIRIA_SMTP_PASSWORD',[^)]*);|define('MISSIRIA_SMTP_PASSWORD', '${EMAIL_PASSWORD}');|" \
                 -e "s|define('MISSIRIA_SMTP_FROM_EMAIL',[^)]*);|define('MISSIRIA_SMTP_FROM_EMAIL', '${email_addr}');|" \
                 -e "s|define('MISSIRIA_SMTP_FROM_NAME',[^)]*);|define('MISSIRIA_SMTP_FROM_NAME', '$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')');|" \
