@@ -21,6 +21,7 @@ All scripts include a consistent CLI header/UI and are intended for Linux server
 | `wp-manager.sh` | WordPress-focused DB operations (migration, content cleanup, maintenance bundle) | Yes | `root`/DB admin |
 | `wp-cron-master.sh` | Trigger `wp-cron.php` and optionally force WP updates via WP-CLI in memory-safe mode | No (argument driven) | `root`/sudo |
 | `site-auto-backup.sh` | Backup active Nginx sites/apps rooted in `/var/www` with files archive and optional WordPress DB dump | No | `root`/DB admin |
+| `optimize-images.sh` | Recursively resize images and convert JPG/PNG/HEIC/TIFF/WebP sources to optimized WebP | No | Regular user |
 | `nx-manager.sh` | Nginx vhost create/update/delete + config test/reload | Yes | `root` |
 | `email-manager.sh` | Mail alias + Maildir permission audit for one email account | No (email argument) | `root`/sudo |
 
@@ -33,6 +34,7 @@ All scripts include a consistent CLI header/UI and are intended for Linux server
 - `sudo` (for forced updates mode)
 - `wp` (WP-CLI) optional; required only for forced update mode in `wp-cron-master.sh`
 - `systemctl` + `nginx -t` support (for Nginx reload path)
+- ImageMagick 7 with HEIC and WebP delegates (for `optimize-images.sh`)
 
 ## Quick Start
 
@@ -51,6 +53,7 @@ Run scripts:
 ./email-manager.sh contact@example.com
 ./wp-cron-master.sh all
 ./batches/site-auto-backup.sh
+./batches/optimize-images.sh /path/to/gallery --dry-run
 ```
 
 ## Script Usage
@@ -168,6 +171,24 @@ Environment overrides:
 - `MYSQLDUMP_BIN` (default: `mysqldump`)
 - `BACKUP_BASE_DIR` (default: `/var/backups/missiria-auto`)
 - `BACKUP_RETENTION_RUNS` (default: `15`)
+
+### `optimize-images.sh`
+
+Usage:
+
+```bash
+./batches/optimize-images.sh /path/to/gallery
+```
+
+Behavior:
+- Recursively converts supported JPG, PNG, HEIC, HEIF, TIFF and WebP sources to WebP
+- Defaults to a maximum `1024x1024` box and quality `82`
+- Preserves aspect ratio, applies EXIF orientation and never enlarges smaller images
+- Writes to `SOURCE_DIR/optimized` while preserving originals and nested directories
+- Skips existing output unless `--force` is supplied
+- Supports `--dry-run`, `--size`, `--quality` and `--output`
+
+See [`image-optimizer.md`](image-optimizer.md) for installation, examples and troubleshooting.
 
 ### `nx-manager.sh`
 
