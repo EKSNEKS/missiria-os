@@ -30,7 +30,7 @@ All scripts include a consistent CLI header/UI and are intended for Linux server
 - Linux host with `bash`
 - `mysql` and `mysqldump` available for DB scripts
 - Nginx layout using `/etc/nginx/sites-available` and `/etc/nginx/sites-enabled` (for `nx-manager.sh`, `wp-cron-master.sh`)
-- `curl` (for cron trigger mode)
+- `curl` (for cron trigger mode and remote image-watermark logos)
 - `sudo` (for forced updates mode)
 - `wp` (WP-CLI) optional; required only for forced update mode in `wp-cron-master.sh`
 - `systemctl` + `nginx -t` support (for Nginx reload path)
@@ -187,6 +187,7 @@ Behavior:
 - Writes to `SOURCE_DIR/optimized` while preserving originals and nested directories
 - Skips existing output unless `--force` is supplied
 - Supports `--dry-run`, `--size`, `--quality` and `--output`
+- Optionally applies a local-file or HTTPS logo plus website text with configurable placement, opacity, margin and sizing
 
 See [`image-optimizer.md`](image-optimizer.md) for installation, examples and troubleshooting.
 
