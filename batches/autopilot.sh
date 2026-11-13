@@ -116,19 +116,23 @@ intake_mode() {
     echo ""
     printf '%b\n' "  ${BOLD}┌─────────────────────────────────────────────────────┐${NC}"
     printf '%b\n' "  ${BOLD}│                                                     │${NC}"
-    printf '%b\n' "  ${BOLD}│   ${BLUE}[N]${NC}${BOLD}  NEW website   — blank setup from scratch    │${NC}"
-    printf '%b\n' "  ${BOLD}│   ${BLUE}[C]${NC}${BOLD}  COPY website  — duplicate / migrate a site  │${NC}"
+    printf '%b\n' "  ${BOLD}│   ${BLUE}[N]${NC}${BOLD}  NEW website     — blank setup from scratch  │${NC}"
+    printf '%b\n' "  ${BOLD}│   ${BLUE}[C]${NC}${BOLD}  COPY website    — duplicate / migrate site  │${NC}"
+    printf '%b\n' "  ${BOLD}│   ${RED}[D]${NC}${BOLD}  DELETE site     — purge everything (backup) │${NC}"
+    printf '%b\n' "  ${BOLD}│   ${GREEN}[R]${NC}${BOLD}  RESTORE site    — rebuild from backup       │${NC}"
     printf '%b\n' "  ${BOLD}│                                                     │${NC}"
     printf '%b\n' "  ${BOLD}└─────────────────────────────────────────────────────┘${NC}"
     echo ""
 
     while true; do
-        ask "Choice [N/C]:"
+        ask "Choice [N/C/D/R]:"
         read -r choice
         case "${choice,,}" in
-            n|new)  MODE="new";  break ;;
-            c|copy) MODE="copy"; break ;;
-            *) warn "Type N for New or C for Copy." ;;
+            n|new)     MODE="new";     break ;;
+            c|copy)    MODE="copy";    break ;;
+            d|delete)  MODE="delete";  break ;;
+            r|restore) MODE="restore"; break ;;
+            *) warn "Type N (New), C (Copy), D (Delete), or R (Restore)." ;;
         esac
     done
 }
@@ -580,6 +584,28 @@ exec_files() {
             fi
         elif [[ -n "$GIT_REPO_URL" ]]; then
             warn "No .git directory in $WEB_ROOT — cannot set remote URL."
+        fi
+
+        # Rewrite robots.txt hostname so the Sitemap: directive (and any other
+        # absolute-URL lines like Host:) point at the new domain. Leaving the
+        # cloned hostname silently feeds the wrong site to Google (MITP-0669).
+        local robots_file="$WEB_ROOT/robots.txt"
+        if [[ -f "$robots_file" && -n "$OLD_URL" && -n "$NEW_URL" && "$OLD_URL" != "$NEW_URL" ]]; then
+            local old_host="${OLD_URL#http://}"; old_host="${old_host#https://}"; old_host="${old_host%/}"
+            local new_host="${NEW_URL#http://}"; new_host="${new_host#https://}"; new_host="${new_host%/}"
+            local old_apex="${old_host#www.}"
+            local new_apex="${new_host#www.}"
+            info "Rewriting robots.txt hostnames: $old_host → $new_host"
+            sed -i \
+                -e "s#https\?://www\.${old_apex//./\\.}#https://${new_host}#g" \
+                -e "s#https\?://${old_apex//./\\.}#https://${new_apex}#g" \
+                "$robots_file"
+            chown www-data:www-data "$robots_file"
+            if grep -qE "^Sitemap: " "$robots_file" 2>/dev/null; then
+                ok "robots.txt Sitemap directive now points at: $(grep -E '^Sitemap: ' "$robots_file" | head -1)"
+            else
+                warn "robots.txt has no Sitemap: directive — consider adding one for Yoast / Rank Math."
+            fi
         fi
     fi
 }
@@ -1546,6 +1572,593 @@ exec_audit() {
 # MAIN
 # ============================================================
 
+# ============================================================
+# DELETE / RESTORE — site removal & rollback
+# ============================================================
+
+# ── Shared state for delete + restore ────────────────────────
+DEL_DOMAIN=""
+DEL_WEB_ROOT=""
+DEL_SLUG=""
+DEL_BRANCH=""
+DEL_DB_NAME=""
+DEL_DB_PREFIX=""
+DEL_EMAIL_USER=""
+DEL_GIT_REMOTE=""
+DEL_BACKUP_DIR=""
+DRY_RUN="${DRY_RUN:-n}"                              # export DRY_RUN=y for dry mode
+DEL_BACKUP_ROOT="${DEL_BACKUP_ROOT:-/root}"           # override for tests
+
+# Docroots that must never be deleted (sync-plugin master, shared templates).
+DEL_BLOCKLIST=(
+    "/var/www/MISSIRIA/eksit/eksit_ik"
+)
+
+# Run or echo a command depending on DRY_RUN.
+run() {
+    if [[ "$DRY_RUN" == "y" ]]; then
+        printf '%b\n' "  ${YELLOW}[dry-run]${NC} $*"
+    else
+        eval "$@"
+    fi
+}
+
+# Read a wp-config.php value: extract_wp_const <file> <NAME>
+extract_wp_const() {
+    local f="$1" name="$2"
+    sed -nE "s/^[[:space:]]*define[[:space:]]*\\([[:space:]]*'${name}'[[:space:]]*,[[:space:]]*'([^']*)'.*/\\1/p" "$f" | head -1
+}
+
+# Read $table_prefix.
+extract_wp_prefix() {
+    local f="$1"
+    sed -nE "s/^[[:space:]]*\\\$table_prefix[[:space:]]*=[[:space:]]*'([^']*)'.*/\\1/p" "$f" | head -1
+}
+
+# ── intake_delete_target ─────────────────────────────────────
+intake_delete_target() {
+    echo ""
+    printf '%b\n' "  ${CYAN}── DELETE TARGET ─────────────────────────────────────${NC}"
+    echo ""
+
+    local -a sites=()
+    while IFS= read -r cfg; do
+        [[ -f "$cfg" ]] && sites+=("$cfg")
+    done < <(find /var/www/MISSIRIA/mit /var/www/MISSIRIA/eksit -maxdepth 2 -name wp-config.php 2>/dev/null | sort)
+
+    if ((${#sites[@]} == 0)); then
+        fail "No MIT/EKSIT sites found (no wp-config.php under /var/www/MISSIRIA/{mit,eksit}/*/)."
+        exit 1
+    fi
+
+    info "Sites detected:"
+    local i=1
+    local -a idx_docroot=() idx_domain=() idx_db=() idx_prefix=() idx_slug=() idx_branch=()
+    for cfg in "${sites[@]}"; do
+        local docroot; docroot="$(dirname "$cfg")"
+        local branch; branch="$(basename "$(dirname "$docroot")")"
+        local slug;   slug="$(basename "$docroot")"
+        local db;     db="$(extract_wp_const "$cfg" DB_NAME)"
+        local prefix; prefix="$(extract_wp_prefix "$cfg")"
+        local home;   home="$(extract_wp_const "$cfg" WP_HOME)"
+        [[ -z "$home" ]] && home="$(extract_wp_const "$cfg" WP_SITEURL)"
+        local domain; domain="${home#https://}"; domain="${domain#http://}"; domain="${domain#www.}"; domain="${domain%%/*}"
+        # Fallback 1: query DB options table (WP_HOME often stored there, not in wp-config).
+        if [[ -z "$domain" && -n "$db" && -n "$prefix" ]]; then
+            local db_home
+            db_home="$(mysql_admin -N -s -e "SELECT option_value FROM \`${db}\`.\`${prefix}options\` WHERE option_name='home' LIMIT 1;" 2>/dev/null)"
+            [[ -z "$db_home" ]] && db_home="$(mysql_admin -N -s -e "SELECT option_value FROM \`${db}\`.\`${prefix}options\` WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
+            domain="${db_home#https://}"; domain="${domain#http://}"; domain="${domain#www.}"; domain="${domain%%/*}"
+        fi
+        # Fallback 2: grep nginx sites-available for a vhost whose root points at this docroot.
+        if [[ -z "$domain" ]]; then
+            local vhost
+            vhost="$(grep -rlE "root[[:space:]]+${docroot}[[:space:]]*;" /etc/nginx/sites-available/ 2>/dev/null | head -1)"
+            if [[ -n "$vhost" ]]; then
+                domain="$(awk '/server_name/ {for(i=2;i<=NF;i++){gsub(";","",$i); if($i!="_"&&$i!=""){print $i; exit}}}' "$vhost")"
+                domain="${domain#www.}"
+            fi
+        fi
+        [[ -z "$domain" ]] && domain="<unknown>"
+        printf "    ${BLUE}[%d]${NC} %-30s → %-14s db=%-25s slug=%s\n" "$i" "$domain" "$branch" "$db" "$slug"
+        idx_docroot+=("$docroot"); idx_domain+=("$domain"); idx_db+=("$db")
+        idx_prefix+=("$prefix"); idx_slug+=("$slug"); idx_branch+=("$branch")
+        i=$((i+1))
+    done
+    echo ""
+
+    local choice
+    while true; do
+        ask "Site number to DELETE (or type domain exactly):"
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]]; then
+            local n=$((choice - 1))
+            if ((n >= 0 && n < ${#sites[@]})); then
+                DEL_WEB_ROOT="${idx_docroot[$n]}"
+                DEL_DOMAIN="${idx_domain[$n]}"
+                DEL_DB_NAME="${idx_db[$n]}"
+                DEL_DB_PREFIX="${idx_prefix[$n]}"
+                DEL_SLUG="${idx_slug[$n]}"
+                DEL_BRANCH="${idx_branch[$n]}"
+                break
+            fi
+        else
+            for n in "${!idx_domain[@]}"; do
+                if [[ "${idx_domain[$n]}" == "$choice" ]]; then
+                    DEL_WEB_ROOT="${idx_docroot[$n]}"
+                    DEL_DOMAIN="${idx_domain[$n]}"
+                    DEL_DB_NAME="${idx_db[$n]}"
+                    DEL_DB_PREFIX="${idx_prefix[$n]}"
+                    DEL_SLUG="${idx_slug[$n]}"
+                    DEL_BRANCH="${idx_branch[$n]}"
+                    break 2
+                fi
+            done
+        fi
+        warn "Invalid selection."
+    done
+
+    # Blocklist check.
+    for blocked in "${DEL_BLOCKLIST[@]}"; do
+        if [[ "$DEL_WEB_ROOT" == "$blocked" ]]; then
+            fail "$DEL_WEB_ROOT is on the delete-blocklist (sync-plugin master / shared template). Aborting."
+            exit 1
+        fi
+    done
+    if [[ ! -f "$DEL_WEB_ROOT/wp-config.php" ]]; then
+        fail "$DEL_WEB_ROOT/wp-config.php missing — refusing to delete a non-WP directory."
+        exit 1
+    fi
+
+    # Look up mailbox user from /etc/postfix/virtual.
+    DEL_EMAIL_USER="$(awk -v d="$DEL_DOMAIN" '$1 ~ ("@"d"$") {print $2; exit}' /etc/postfix/virtual 2>/dev/null || true)"
+
+    # Capture git remote for the manual-checklist section (repo will be gone by then).
+    DEL_GIT_REMOTE=""
+    if [[ -d "$DEL_WEB_ROOT/.git" ]]; then
+        DEL_GIT_REMOTE="$(git -C "$DEL_WEB_ROOT" remote get-url origin 2>/dev/null || true)"
+    fi
+}
+
+# ── intake_delete_confirm — 2× typed domain + summary ───────
+intake_delete_confirm() {
+    echo ""
+    printf '%b\n' "  ${RED}${BOLD}══════════════════ DELETE PLAN ══════════════════${NC}"
+    printf '%b\n' "  Domain          : ${BOLD}$DEL_DOMAIN${NC}"
+    printf '%b\n' "  Web root        : $DEL_WEB_ROOT"
+    printf '%b\n' "  Branch          : $DEL_BRANCH / slug $DEL_SLUG"
+    printf '%b\n' "  Database        : $DEL_DB_NAME  (prefix ${DEL_DB_PREFIX:-<unknown>})"
+    printf '%b\n' "  Mailbox user    : ${DEL_EMAIL_USER:-<none in /etc/postfix/virtual>}"
+    printf '%b\n' "  Nginx vhost     : /etc/nginx/sites-available/$DEL_DOMAIN"
+    printf '%b\n' "  TLS cert        : /etc/letsencrypt/live/$DEL_DOMAIN"
+    printf '%b\n' "  OpenDKIM        : /etc/opendkim/keys/$DEL_DOMAIN + Key/Signing/Trusted tables"
+    printf '%b\n' "  Git remote      : ${DEL_GIT_REMOTE:-<none>} (repo NOT deleted on GitHub — manual)"
+    printf '%b\n' "  Dry-run         : ${DRY_RUN}"
+    printf '%b\n' "  Backup dir      : ${DEL_BACKUP_ROOT}/.deleted-${DEL_DOMAIN}-<epoch>/"
+    printf '%b\n' "  ${RED}${BOLD}═════════════════════════════════════════════════${NC}"
+    echo ""
+
+    if [[ "$DRY_RUN" != "y" ]]; then
+        if [[ -z "$DEL_DOMAIN" || "$DEL_DOMAIN" == "<unknown>" ]]; then
+            fail "Cannot resolve domain for $DEL_WEB_ROOT (no WP_HOME in wp-config, no DB match, no nginx vhost). Aborting for safety."
+            exit 1
+        fi
+        local t1 t2
+        ask "Type the domain ${BOLD}${DEL_DOMAIN}${NC} to confirm deletion:"
+        read -r t1
+        if [[ "$t1" != "$DEL_DOMAIN" ]]; then
+            fail "Confirmation mismatch. Aborting."
+            exit 1
+        fi
+        ask "Type it ONE MORE TIME:"
+        read -r t2
+        if [[ "$t2" != "$DEL_DOMAIN" ]]; then
+            fail "Confirmation mismatch. Aborting."
+            exit 1
+        fi
+    else
+        warn "DRY RUN mode — no changes will be applied. Backup phase still runs."
+    fi
+}
+
+# ── exec_delete_backup — everything goes to /root/.deleted-<domain>-<epoch>/ ──
+exec_delete_backup() {
+    section "1/9" "BACKUP"
+
+    local epoch; epoch="$(date +%s)"
+    DEL_BACKUP_DIR="${DEL_BACKUP_ROOT}/.deleted-${DEL_DOMAIN}-${epoch}"
+    mkdir -p "$DEL_BACKUP_DIR"
+
+    info "Backup dir: $DEL_BACKUP_DIR"
+
+    # 1. Docroot tarball (exclude caches).
+    if [[ -d "$DEL_WEB_ROOT" ]]; then
+        info "Tar docroot → docroot.tar.gz"
+        tar --exclude="$DEL_WEB_ROOT/wp-content/cache" \
+            --exclude="$DEL_WEB_ROOT/wp-content/uploads/cache" \
+            -czf "$DEL_BACKUP_DIR/docroot.tar.gz" \
+            -C / "${DEL_WEB_ROOT#/}" 2>>"$DEL_BACKUP_DIR/backup.err" \
+            || { fail "docroot tar failed — check $DEL_BACKUP_DIR/backup.err"; exit 1; }
+    else
+        warn "Web root missing on disk — skipping docroot tar."
+    fi
+
+    # 2. Database dump.
+    if [[ -n "$DEL_DB_NAME" ]] && database_exists "$DEL_DB_NAME"; then
+        info "mysqldump $DEL_DB_NAME → db.sql.gz"
+        mysql_admin -e "SET GLOBAL innodb_stats_on_metadata = 0;" 2>/dev/null || true
+        MYSQL_PWD="$MYSQL_ADMIN_PASS" "$MYSQLDUMP_BIN" \
+            -u "$MYSQL_ADMIN_USER" \
+            --single-transaction --routines --triggers --add-drop-table \
+            "$DEL_DB_NAME" 2>>"$DEL_BACKUP_DIR/backup.err" \
+            | gzip > "$DEL_BACKUP_DIR/db.sql.gz" \
+            || { fail "mysqldump failed — check $DEL_BACKUP_DIR/backup.err"; exit 1; }
+    else
+        warn "DB $DEL_DB_NAME not found — skipping dump."
+    fi
+
+    # 3. Nginx vhost.
+    for f in "/etc/nginx/sites-available/$DEL_DOMAIN" "/etc/nginx/sites-available/$DEL_DOMAIN.conf"; do
+        [[ -f "$f" ]] && cp -a "$f" "$DEL_BACKUP_DIR/nginx.conf" && break
+    done
+    [[ -f "$DEL_BACKUP_DIR/nginx.conf" ]] && info "Nginx vhost saved." || warn "No nginx vhost found."
+
+    # 4. Certbot live + renewal.
+    if [[ -d "/etc/letsencrypt/live/$DEL_DOMAIN" ]] || [[ -f "/etc/letsencrypt/renewal/$DEL_DOMAIN.conf" ]]; then
+        info "Tar certbot live + renewal → certbot-live.tar.gz"
+        tar -czf "$DEL_BACKUP_DIR/certbot-live.tar.gz" \
+            -C / \
+            "etc/letsencrypt/live/$DEL_DOMAIN" \
+            "etc/letsencrypt/renewal/$DEL_DOMAIN.conf" \
+            "etc/letsencrypt/archive/$DEL_DOMAIN" \
+            2>>"$DEL_BACKUP_DIR/backup.err" || warn "Some cert paths missing — partial tar."
+    fi
+
+    # 5. OpenDKIM keys.
+    if [[ -d "/etc/opendkim/keys/$DEL_DOMAIN" ]]; then
+        info "Tar DKIM keys → dkim.tar.gz"
+        tar -czf "$DEL_BACKUP_DIR/dkim.tar.gz" -C / "etc/opendkim/keys/$DEL_DOMAIN" \
+            2>>"$DEL_BACKUP_DIR/backup.err" || warn "DKIM tar had errors."
+    fi
+
+    # 6. Mailbox.
+    if [[ -n "$DEL_EMAIL_USER" && -d "/home/$DEL_EMAIL_USER/Maildir" ]]; then
+        info "Tar mailbox /home/$DEL_EMAIL_USER/Maildir → maildir.tar.gz"
+        tar -czf "$DEL_BACKUP_DIR/maildir.tar.gz" -C / "home/$DEL_EMAIL_USER" \
+            2>>"$DEL_BACKUP_DIR/backup.err" || warn "Maildir tar had errors."
+    fi
+
+    # 7. Manifest for restore.
+    cat > "$DEL_BACKUP_DIR/manifest.json" <<EOF
+{
+  "domain":       "$DEL_DOMAIN",
+  "web_root":     "$DEL_WEB_ROOT",
+  "slug":         "$DEL_SLUG",
+  "branch":       "$DEL_BRANCH",
+  "db_name":      "$DEL_DB_NAME",
+  "db_prefix":    "$DEL_DB_PREFIX",
+  "email_user":   "$DEL_EMAIL_USER",
+  "git_remote":   "$DEL_GIT_REMOTE",
+  "epoch":        "$epoch",
+  "autopilot":    "v3-delete"
+}
+EOF
+    ok "Backup complete → $DEL_BACKUP_DIR"
+    ls -lh "$DEL_BACKUP_DIR" | tail -n +2 | awk '{printf "    %-8s %s\n", $5, $NF}'
+}
+
+# ── exec_delete_nginx ────────────────────────────────────────
+exec_delete_nginx() {
+    section "2/9" "NGINX"
+    for f in "/etc/nginx/sites-enabled/$DEL_DOMAIN" "/etc/nginx/sites-enabled/$DEL_DOMAIN.conf"; do
+        [[ -L "$f" || -f "$f" ]] && run "unlink '$f'"
+    done
+    for f in "/etc/nginx/sites-available/$DEL_DOMAIN" "/etc/nginx/sites-available/$DEL_DOMAIN.conf"; do
+        [[ -f "$f" ]] && run "rm -f '$f'"
+    done
+    if [[ "$DRY_RUN" != "y" ]]; then
+        nginx -t 2>/dev/null && systemctl reload nginx && ok "nginx reloaded" || warn "nginx -t failed; not reloading"
+    fi
+}
+
+# ── exec_delete_certbot ──────────────────────────────────────
+exec_delete_certbot() {
+    section "3/9" "CERTBOT"
+    if [[ -d "/etc/letsencrypt/live/$DEL_DOMAIN" ]]; then
+        run "certbot revoke --non-interactive --cert-name '$DEL_DOMAIN' --reason superseded 2>&1 | tail -3 || true"
+        run "certbot delete --non-interactive --cert-name '$DEL_DOMAIN' 2>&1 | tail -3 || true"
+    else
+        info "No cert for $DEL_DOMAIN — skipping revoke."
+    fi
+}
+
+# ── exec_delete_email ────────────────────────────────────────
+exec_delete_email() {
+    section "4/9" "EMAIL / DKIM"
+
+    # Postfix virtual: remove any line whose LHS ends with @$DEL_DOMAIN.
+    if grep -qE "@${DEL_DOMAIN}[[:space:]]" /etc/postfix/virtual 2>/dev/null; then
+        run "sed -i.bak-delete-$$ '/@${DEL_DOMAIN}[[:space:]]/d' /etc/postfix/virtual"
+        run "postmap /etc/postfix/virtual"
+    fi
+
+    # Postfix main.cf: strip $DEL_DOMAIN from virtual_alias_domains =.
+    if grep -qE "^virtual_alias_domains[[:space:]]*=" /etc/postfix/main.cf; then
+        run "sed -i.bak-delete-$$ -E 's/(virtual_alias_domains[[:space:]]*=.*)([[:space:]]*,[[:space:]]*|[[:space:]]+)${DEL_DOMAIN//./\\.}\\b/\\1/; s/(virtual_alias_domains[[:space:]]*=[[:space:]]*)${DEL_DOMAIN//./\\.}[[:space:]]*,?[[:space:]]*/\\1/' /etc/postfix/main.cf"
+    fi
+    [[ "$DRY_RUN" != "y" ]] && systemctl reload postfix 2>/dev/null && ok "postfix reloaded"
+
+    # OpenDKIM tables.
+    for tbl in KeyTable SigningTable TrustedHosts; do
+        if grep -q "$DEL_DOMAIN" "/etc/opendkim/$tbl" 2>/dev/null; then
+            run "sed -i.bak-delete-$$ '/${DEL_DOMAIN//./\\.}/d' '/etc/opendkim/$tbl'"
+        fi
+    done
+    [[ -d "/etc/opendkim/keys/$DEL_DOMAIN" ]] && run "rm -rf '/etc/opendkim/keys/$DEL_DOMAIN'"
+    [[ "$DRY_RUN" != "y" ]] && systemctl reload opendkim 2>/dev/null && ok "opendkim reloaded"
+
+    # Dovecot users file.
+    if [[ -n "$DEL_EMAIL_USER" ]] && grep -q "^${DEL_EMAIL_USER}:" /etc/dovecot/users 2>/dev/null; then
+        run "sed -i.bak-delete-$$ '/^${DEL_EMAIL_USER}:/d' /etc/dovecot/users"
+    fi
+}
+
+# ── exec_delete_mailbox ─────────────────────────────────────
+exec_delete_mailbox() {
+    section "5/9" "MAILBOX"
+    if [[ -z "$DEL_EMAIL_USER" ]]; then
+        info "No mailbox user recorded — skipping."
+        return
+    fi
+    if id "$DEL_EMAIL_USER" &>/dev/null; then
+        run "userdel -r '$DEL_EMAIL_USER' 2>/dev/null || rm -rf '/home/$DEL_EMAIL_USER'"
+    elif [[ -d "/home/$DEL_EMAIL_USER" ]]; then
+        run "rm -rf '/home/$DEL_EMAIL_USER'"
+    fi
+}
+
+# ── exec_delete_database ────────────────────────────────────
+exec_delete_database() {
+    section "6/9" "DATABASE"
+    if [[ -z "$DEL_DB_NAME" ]]; then
+        info "No DB name — skipping."
+        return
+    fi
+    if database_exists "$DEL_DB_NAME"; then
+        local qdb; qdb="$(quote_identifier "$DEL_DB_NAME")"
+        run "mysql_admin -e \"DROP DATABASE $qdb;\""
+    else
+        info "DB $DEL_DB_NAME already absent."
+    fi
+}
+
+# ── exec_delete_files ───────────────────────────────────────
+exec_delete_files() {
+    section "7/9" "FILES"
+    if [[ -d "$DEL_WEB_ROOT" ]]; then
+        run "rm -rf '$DEL_WEB_ROOT'"
+    else
+        info "Web root already gone."
+    fi
+}
+
+# ── exec_delete_logs ────────────────────────────────────────
+exec_delete_logs() {
+    section "8/9" "LOGS"
+    # Kept out of the backup on purpose — logs are noise, not state.
+    for f in /var/log/nginx/${DEL_DOMAIN}*.log*; do
+        [[ -f "$f" ]] && run "rm -f '$f'"
+    done
+}
+
+# ── exec_delete_manual_checklist ────────────────────────────
+exec_delete_manual_checklist() {
+    section "9/9" "MANUAL CHECKLIST"
+    printf '%b\n' "  ${BOLD}${YELLOW}MANUAL STEPS REMAINING for $DEL_DOMAIN${NC}"
+    printf '%b\n' "    1) Contabo DNS panel     — remove zone for $DEL_DOMAIN"
+    printf '%b\n' "    2) Cloudflare            — remove zone if managed there"
+    printf '%b\n' "    3) GitHub repo           — archive/delete: ${DEL_GIT_REMOTE:-<none>}"
+    printf '%b\n' "    4) Google Search Console — remove property for $DEL_DOMAIN and www.$DEL_DOMAIN"
+    printf '%b\n' "    5) External SEO tools    — Yoast/Semrush/Ahrefs project entries"
+    echo ""
+    printf '%b\n' "  ${GREEN}${BOLD}Backup preserved at:${NC} $DEL_BACKUP_DIR"
+    printf '%b\n' "  ${GREEN}Restore command:${NC}     autopilot.sh   → mode R   → paste backup dir"
+}
+
+# ============================================================
+# RESTORE — rebuild from a backup dir
+# ============================================================
+
+RES_BACKUP_DIR=""
+RES_FORCE="${RES_FORCE:-n}"
+
+# ── intake_restore_source ───────────────────────────────────
+intake_restore_source() {
+    echo ""
+    printf '%b\n' "  ${CYAN}── RESTORE SOURCE ────────────────────────────────────${NC}"
+    echo ""
+
+    local -a backups=()
+    while IFS= read -r d; do
+        [[ -f "$d/manifest.json" ]] && backups+=("$d")
+    done < <(find "$DEL_BACKUP_ROOT" -maxdepth 1 -type d -name '.deleted-*' 2>/dev/null | sort -r)
+
+    if ((${#backups[@]} > 0)); then
+        info "Available backups (newest first):"
+        for i in "${!backups[@]}"; do
+            local dom epoch
+            dom="$(sed -nE 's/.*"domain":[[:space:]]*"([^"]+)".*/\1/p' "${backups[$i]}/manifest.json" | head -1)"
+            epoch="$(sed -nE 's/.*"epoch":[[:space:]]*"([^"]+)".*/\1/p' "${backups[$i]}/manifest.json" | head -1)"
+            local when; when="$(date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+            printf '    ${BLUE}[%d]${NC} %s   %s   ← %s\n' "$((i+1))" "$dom" "$when" "${backups[$i]}"
+        done
+        echo ""
+        ask "Backup number (or paste full path):"
+    else
+        ask "Backup dir full path (contains manifest.json):"
+    fi
+
+    local choice
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((${#backups[@]} > 0)); then
+        local n=$((choice - 1))
+        ((n >= 0 && n < ${#backups[@]})) && RES_BACKUP_DIR="${backups[$n]}"
+    else
+        RES_BACKUP_DIR="$choice"
+    fi
+
+    if [[ ! -f "$RES_BACKUP_DIR/manifest.json" ]]; then
+        fail "No manifest.json at $RES_BACKUP_DIR"
+        exit 1
+    fi
+
+    DEL_DOMAIN="$(sed -nE 's/.*"domain":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_WEB_ROOT="$(sed -nE 's/.*"web_root":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_SLUG="$(sed -nE 's/.*"slug":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_BRANCH="$(sed -nE 's/.*"branch":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_DB_NAME="$(sed -nE 's/.*"db_name":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_DB_PREFIX="$(sed -nE 's/.*"db_prefix":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_EMAIL_USER="$(sed -nE 's/.*"email_user":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+    DEL_GIT_REMOTE="$(sed -nE 's/.*"git_remote":[[:space:]]*"([^"]+)".*/\1/p' "$RES_BACKUP_DIR/manifest.json" | head -1)"
+}
+
+# ── intake_restore_confirm ──────────────────────────────────
+intake_restore_confirm() {
+    echo ""
+    printf '%b\n' "  ${GREEN}${BOLD}══════════════════ RESTORE PLAN ══════════════════${NC}"
+    printf '%b\n' "  Backup dir      : $RES_BACKUP_DIR"
+    printf '%b\n' "  Domain          : $DEL_DOMAIN"
+    printf '%b\n' "  Web root        : $DEL_WEB_ROOT"
+    printf '%b\n' "  Branch / slug   : $DEL_BRANCH / $DEL_SLUG"
+    printf '%b\n' "  Database        : $DEL_DB_NAME  (prefix ${DEL_DB_PREFIX:-<unknown>})"
+    printf '%b\n' "  Mailbox user    : ${DEL_EMAIL_USER:-<none>}"
+    printf '%b\n' "  Force overwrite : ${RES_FORCE}"
+    printf '%b\n' "  ${GREEN}${BOLD}══════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Collision guard.
+    if [[ "$RES_FORCE" != "y" ]]; then
+        local -a collisions=()
+        [[ -d "$DEL_WEB_ROOT" ]] && collisions+=("docroot $DEL_WEB_ROOT")
+        [[ -f "/etc/nginx/sites-available/$DEL_DOMAIN" ]] && collisions+=("nginx vhost")
+        [[ -n "$DEL_DB_NAME" ]] && database_exists "$DEL_DB_NAME" && collisions+=("database $DEL_DB_NAME")
+        [[ -n "$DEL_EMAIL_USER" ]] && id "$DEL_EMAIL_USER" &>/dev/null && collisions+=("system user $DEL_EMAIL_USER")
+        if ((${#collisions[@]} > 0)); then
+            fail "Collisions detected — refusing to restore. Set RES_FORCE=y to overwrite."
+            for c in "${collisions[@]}"; do printf '    - %s\n' "$c"; done
+            exit 1
+        fi
+    fi
+
+    confirm "Proceed with RESTORE?" || { info "Cancelled."; exit 0; }
+}
+
+# ── exec_restore_files ──────────────────────────────────────
+exec_restore_files() {
+    section "1/7" "RESTORE FILES"
+    [[ -f "$RES_BACKUP_DIR/docroot.tar.gz" ]] || { warn "No docroot.tar.gz — skipping."; return; }
+    run "tar -xzf '$RES_BACKUP_DIR/docroot.tar.gz' -C /"
+    [[ -d "$DEL_WEB_ROOT" ]] && run "chown -R www-data:www-data '$DEL_WEB_ROOT'"
+}
+
+# ── exec_restore_database ───────────────────────────────────
+exec_restore_database() {
+    section "2/7" "RESTORE DATABASE"
+    [[ -f "$RES_BACKUP_DIR/db.sql.gz" ]] || { warn "No db.sql.gz — skipping."; return; }
+    local qdb; qdb="$(quote_identifier "$DEL_DB_NAME")"
+    run "mysql_admin -e \"CREATE DATABASE IF NOT EXISTS $qdb DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
+    if [[ "$DRY_RUN" != "y" ]]; then
+        gunzip -c "$RES_BACKUP_DIR/db.sql.gz" | MYSQL_PWD="$MYSQL_ADMIN_PASS" "$MYSQL_BIN" -u "$MYSQL_ADMIN_USER" "$DEL_DB_NAME"
+    else
+        printf '%b\n' "  ${YELLOW}[dry-run]${NC} gunzip -c $RES_BACKUP_DIR/db.sql.gz | mysql $DEL_DB_NAME"
+    fi
+}
+
+# ── exec_restore_nginx ──────────────────────────────────────
+exec_restore_nginx() {
+    section "3/7" "RESTORE NGINX"
+    [[ -f "$RES_BACKUP_DIR/nginx.conf" ]] || { warn "No nginx.conf — skipping."; return; }
+    run "cp '$RES_BACKUP_DIR/nginx.conf' '/etc/nginx/sites-available/$DEL_DOMAIN'"
+    [[ -L "/etc/nginx/sites-enabled/$DEL_DOMAIN" ]] || \
+        run "ln -sf '/etc/nginx/sites-available/$DEL_DOMAIN' '/etc/nginx/sites-enabled/$DEL_DOMAIN'"
+    if [[ "$DRY_RUN" != "y" ]]; then
+        nginx -t 2>/dev/null && systemctl reload nginx && ok "nginx reloaded" || warn "nginx -t failed."
+    fi
+}
+
+# ── exec_restore_certbot ────────────────────────────────────
+exec_restore_certbot() {
+    section "4/7" "RESTORE CERTBOT"
+    if [[ -f "$RES_BACKUP_DIR/certbot-live.tar.gz" ]]; then
+        run "tar -xzf '$RES_BACKUP_DIR/certbot-live.tar.gz' -C /"
+        warn "Cert was REVOKED at delete time. Run: certbot certonly --nginx -d $DEL_DOMAIN -d www.$DEL_DOMAIN"
+    fi
+}
+
+# ── exec_restore_email ──────────────────────────────────────
+exec_restore_email() {
+    section "5/7" "RESTORE EMAIL / DKIM"
+
+    # DKIM.
+    if [[ -f "$RES_BACKUP_DIR/dkim.tar.gz" ]]; then
+        run "tar -xzf '$RES_BACKUP_DIR/dkim.tar.gz' -C /"
+        # Reinsert Key/Signing/TrustedHosts entries if absent.
+        local key_line="mail._domainkey.$DEL_DOMAIN $DEL_DOMAIN:mail:/etc/opendkim/keys/$DEL_DOMAIN/mail.private"
+        local sign_line="*@$DEL_DOMAIN mail._domainkey.$DEL_DOMAIN"
+        grep -q "$DEL_DOMAIN" /etc/opendkim/KeyTable       || run "echo '$key_line'  >> /etc/opendkim/KeyTable"
+        grep -q "$DEL_DOMAIN" /etc/opendkim/SigningTable   || run "echo '$sign_line' >> /etc/opendkim/SigningTable"
+        grep -q "^$DEL_DOMAIN$" /etc/opendkim/TrustedHosts || run "echo '$DEL_DOMAIN'   >> /etc/opendkim/TrustedHosts"
+        [[ "$DRY_RUN" != "y" ]] && systemctl reload opendkim 2>/dev/null && ok "opendkim reloaded"
+    fi
+
+    # Postfix virtual alias.
+    if [[ -n "$DEL_EMAIL_USER" ]] && ! grep -q "@${DEL_DOMAIN}" /etc/postfix/virtual; then
+        run "echo 'contact@$DEL_DOMAIN $DEL_EMAIL_USER' >> /etc/postfix/virtual"
+        run "postmap /etc/postfix/virtual"
+    fi
+
+    # Postfix main.cf virtual_alias_domains.
+    if ! grep -qE "^virtual_alias_domains.*${DEL_DOMAIN//./\\.}\\b" /etc/postfix/main.cf; then
+        run "sed -i.bak-restore-$$ -E 's/^(virtual_alias_domains[[:space:]]*=[[:space:]]*)(.*)$/\\1$DEL_DOMAIN, \\2/' /etc/postfix/main.cf"
+    fi
+    [[ "$DRY_RUN" != "y" ]] && systemctl reload postfix 2>/dev/null && ok "postfix reloaded"
+}
+
+# ── exec_restore_mailbox ────────────────────────────────────
+exec_restore_mailbox() {
+    section "6/7" "RESTORE MAILBOX"
+    [[ -f "$RES_BACKUP_DIR/maildir.tar.gz" ]] || { info "No mailbox tar — skipping."; return; }
+    if [[ -n "$DEL_EMAIL_USER" ]] && ! id "$DEL_EMAIL_USER" &>/dev/null; then
+        run "useradd -m -s /usr/sbin/nologin '$DEL_EMAIL_USER'"
+    fi
+    run "tar -xzf '$RES_BACKUP_DIR/maildir.tar.gz' -C /"
+    [[ -n "$DEL_EMAIL_USER" ]] && run "chown -R '$DEL_EMAIL_USER:$DEL_EMAIL_USER' '/home/$DEL_EMAIL_USER'"
+
+    # Dovecot users line — restore from backup or synthesize minimal placeholder.
+    if [[ -n "$DEL_EMAIL_USER" ]] && ! grep -q "^${DEL_EMAIL_USER}:" /etc/dovecot/users 2>/dev/null; then
+        warn "dovecot /etc/dovecot/users needs manual re-add for $DEL_EMAIL_USER (password hash not in backup)"
+    fi
+}
+
+# ── exec_restore_verify ─────────────────────────────────────
+exec_restore_verify() {
+    section "7/7" "VERIFY"
+    if [[ -n "$DEL_DB_NAME" ]] && database_exists "$DEL_DB_NAME"; then
+        local qtbl; qtbl="$(quote_identifier "${DEL_DB_PREFIX}options")"
+        local n; n="$(mysql_admin -N -s -e "SELECT COUNT(*) FROM $DEL_DB_NAME.$qtbl;" 2>/dev/null || echo '?')"
+        info "wp_options row count: $n"
+    fi
+    if [[ -d "$DEL_WEB_ROOT" ]]; then
+        info "Docroot back at: $DEL_WEB_ROOT ($(du -sh "$DEL_WEB_ROOT" 2>/dev/null | cut -f1))"
+    fi
+    info "HTTPS smoke test: curl -sk --resolve $DEL_DOMAIN:443:127.0.0.1 https://$DEL_DOMAIN/  |  head -5"
+    ok "Restore complete."
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
 main() {
     print_header
     check_mysql_health
@@ -1557,6 +2170,42 @@ main() {
     printf '%b\n' "${CYAN}${BOLD}  ╚══════════════════════════════════════════════════╝${NC}"
 
     intake_mode
+
+    # ── DELETE branch — separate flow, exits after execution ─
+    if [[ "$MODE" == "delete" ]]; then
+        intake_mysql_admin
+        intake_delete_target
+        intake_delete_confirm
+        exec_delete_backup
+        exec_delete_nginx
+        exec_delete_certbot
+        exec_delete_email
+        exec_delete_mailbox
+        exec_delete_database
+        exec_delete_files
+        exec_delete_logs
+        exec_delete_manual_checklist
+        printf '%b\n' "${GREEN}${BOLD}  🗑️   Site $DEL_DOMAIN deleted (backup at $DEL_BACKUP_DIR)${NC}"
+        exit 0
+    fi
+
+    # ── RESTORE branch ───────────────────────────────────────
+    if [[ "$MODE" == "restore" ]]; then
+        intake_restore_source
+        intake_mysql_admin
+        intake_restore_confirm
+        exec_restore_files
+        exec_restore_database
+        exec_restore_nginx
+        exec_restore_certbot
+        exec_restore_email
+        exec_restore_mailbox
+        exec_restore_verify
+        printf '%b\n' "${GREEN}${BOLD}  ♻️   Site $DEL_DOMAIN restored from $RES_BACKUP_DIR${NC}"
+        exit 0
+    fi
+
+    # ── NEW / COPY branches (existing behaviour) ─────────────
     intake_domain
     [[ "$MODE" == "copy" ]] && intake_copy_source
     intake_database
