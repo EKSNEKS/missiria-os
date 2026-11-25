@@ -276,7 +276,7 @@ run_flow new ok; rc=$?
 check     "exit 0"                                              test "$rc" -eq 0
 check     "HTTPS vhost written with own certificate"            grep -q "ssl_certificate     $LE_DIR/live/$DST/fullchain.pem" "$(AV)"
 check     "HTTP → HTTPS redirect present"                       grep -q 'return 301 https://$host$request_uri;' "$(AV)"
-check     "listener form matches fleet majority"                grep -q "listen 443 ssl;" "$(AV)"
+check     "listener form matches the fleet (ssl http2)"         grep -q "listen 443 ssl http2;" "$(AV)"
 check     "config valid"                                        sb_nginx_ok
 show_on_fail "$f0"
 

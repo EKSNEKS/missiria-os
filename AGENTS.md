@@ -140,7 +140,7 @@ nginx -t && systemctl reload nginx
 
 **Tests:** `bash batches/tests/autopilot-ssl-bootstrap.test.sh` — sandbox nginx prefix + stub certbot, real `nginx -t`; never touches `/etc/nginx` or reloads the live server.
 
-**"protocol options redefined for 0.0.0.0:443" warnings** — separate from certificate errors and never fatal. Cause: vhosts sharing the `:443` socket declare different listen options (`listen 443 ssl;` in most vhosts, `listen 443 ssl http2;` in a few). The autopilot HTTPS template uses `listen 443 ssl;` (fleet majority) so it adds none; a copied vhost keeps the source's listener form. Removing the existing warnings means aligning the `http2` vhosts with the rest — a fleet change, not part of provisioning.
+**"protocol options redefined for 0.0.0.0:443" warnings** — separate from certificate errors and never fatal. Cause: vhosts sharing the `:443` socket declare different listen options. Fixed fleet-wide on 2026-11-25: all 101 listeners now use `listen 443 ssl http2;` (HTTP/2 was already active for every vhost through the shared socket, so behaviour did not change). Rule: every new `:443` listener must be `ssl http2` — the autopilot templates are. Check: `nginx -t 2>&1 | grep -c warn` must print 0. Pre-change vhosts: `/root/backups/nginx-listen-http2-20261125.tar.gz`.
 
 ---
 

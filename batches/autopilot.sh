@@ -855,8 +855,9 @@ EOF
 }
 
 # HTTPS vhost for a site that has no source config to inherit from.
-# Listener form `listen 443 ssl;` matches the fleet majority, so this
-# template adds no new "protocol options redefined" warning.
+# Every :443 listener on this server uses `listen 443 ssl http2;`. Keep the
+# form identical everywhere: one differing listener brings back the
+# "protocol options redefined" warnings for the whole shared socket.
 _nginx_write_https() {
     local dst="$1"
     local fpm_sock; fpm_sock="$(_resolve_fpm_sock)"
@@ -879,8 +880,8 @@ server {
 
 # ── HTTPS ─────────────────────────────────────────────────
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $DOMAIN www.$DOMAIN;
     root $WEB_ROOT;
     index index.php index.html index.htm;
@@ -1813,8 +1814,8 @@ server {
 
 # ── FRONT DOOR (HTTPS :443 → Varnish :6081) ──────────────
 server {
-    listen [::]:443 ssl;
-    listen 443 ssl;
+    listen [::]:443 ssl http2;
+    listen 443 ssl http2;
     server_name $DOMAIN www.$DOMAIN;
 
     ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem; # managed by Certbot
