@@ -55,6 +55,17 @@ ENABLE_VARNISH="n"
 PHP_VER="8.3"
 SKIP_CERTBOT="n"
 
+# ── Nginx / Let's Encrypt locations (overridable for sandbox tests) ─
+NGINX_DIR="${NGINX_DIR:-/etc/nginx}"
+# NGINX_CONF: optional alternate main config for `nginx -t -c` (tests only).
+# It MUST declare the live `user` and its own *_temp_path dirs: `nginx -t`
+# as root chowns every temp path to the configured user, live ones included.
+NGINX_CONF="${NGINX_CONF:-}"
+LE_DIR="${LE_DIR:-/etc/letsencrypt}"
+CERTBOT_BIN="${CERTBOT_BIN:-certbot}"
+CERT_MIN_DAYS="${CERT_MIN_DAYS:-7}"   # a cert expiring sooner than this is renewed
+NGINX_TEST_OUTPUT=""
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -548,8 +559,7 @@ exec_files() {
         ok "Web root ready: $WEB_ROOT"
     else
         if [[ ! -d "$SRC_WEB_ROOT" ]]; then
-            fail "Source web root not found: $SRC_WEB_ROOT"
-            return
+            die 10 "FILES (source web root)" "Source web root not found: $SRC_WEB_ROOT"
         fi
 
         info "Creating target: $WEB_ROOT"
@@ -559,8 +569,7 @@ exec_files() {
         if rsync -a --delete "$SRC_WEB_ROOT/" "$WEB_ROOT/"; then
             ok "Files copied."
         else
-            fail "rsync failed — check manually."
-            return
+            die 10 "FILES (rsync)" "rsync $SRC_WEB_ROOT → $WEB_ROOT failed — check manually, then re-run."
         fi
 
         chown -R www-data:www-data "$WEB_ROOT"
@@ -610,85 +619,213 @@ exec_files() {
     fi
 }
 
-exec_nginx() {
-    section "2/7" "NGINX"
+# ============================================================
+# NGINX + CERTIFICATE HELPERS  (YITP-0268)
+#
+# Order of operations for a domain that has no certificate yet:
+#   1. exec_nginx    → baseline `nginx -t`, then install an HTTP-only
+#                      bootstrap vhost; the intended HTTPS vhost is parked
+#                      next to it as <domain>.ssl-pending (never loaded).
+#   2. exec_certbot  → `certbot certonly --nginx` (no installer: certbot
+#                      never rewrites vhosts), verify the issued files,
+#                      then swap the parked HTTPS vhost in.
+# Every swap goes through _nginx_install: whole-config test BEFORE reload,
+# automatic restore of the previous file + symlink when the test fails.
+# Any failure calls die → nonzero exit, later steps do not run.
+# ============================================================
 
-    local avail="/etc/nginx/sites-available/$DOMAIN"
-    local enabled="/etc/nginx/sites-enabled/$DOMAIN"
-
-    if [[ "$MODE" == "new" ]]; then
-        _nginx_write_new "$avail"
-    else
-        local src_conf="/etc/nginx/sites-available/$SRC_DOMAIN"
-        if [[ -f "$src_conf" ]]; then
-            info "Copying config: $SRC_DOMAIN → $DOMAIN ..."
-            sed \
-                -e "s|server_name [^;]*;|server_name $DOMAIN www.$DOMAIN;|g" \
-                -e "s|root [^;]*;|root $WEB_ROOT;|g" \
-                -e "s|/etc/letsencrypt/live/${SRC_DOMAIN}/|/etc/letsencrypt/live/${DOMAIN}/|g" \
-                -e "s|/var/log/nginx/${SRC_DOMAIN}|/var/log/nginx/${DOMAIN}|g" \
-                "$src_conf" > "$avail"
-            ok "Config copied and adapted from $SRC_DOMAIN."
-        else
-            warn "Source config not found ($src_conf) — creating fresh config."
-            _nginx_write_new "$avail"
-        fi
-    fi
-
-    [[ -L "$enabled" || -f "$enabled" ]] && rm -f "$enabled"
-    ln -s "$avail" "$enabled"
-
-    info "Testing Nginx config..."
-    if nginx -t 2>&1; then
-        systemctl reload nginx
-        ok "Nginx reloaded — $DOMAIN live on HTTP."
-    else
-        # If failure is caused by a missing SSL cert (copied from source before certbot ran),
-        # fall back to a plain HTTP config so certbot can complete the ACME challenge.
-        if nginx -t 2>&1 | grep -q 'cannot load certificate'; then
-            warn "SSL cert not found — writing temporary HTTP config so Certbot can run..."
-            cp "$avail" "${avail}.ssl-backup"
-            _nginx_write_new "$avail"
-            if nginx -t 2>&1; then
-                systemctl reload nginx
-                ok "Temporary HTTP config loaded — Certbot will upgrade to HTTPS."
-                info "SSL backup saved at: ${avail}.ssl-backup"
-            else
-                fail "Nginx config test FAILED even with HTTP config — removing symlink."
-                rm -f "$enabled"
-            fi
-        else
-            fail "Nginx config test FAILED — removing symlink. Fix it in sites-available and re-run."
-            rm -f "$enabled"
-        fi
-    fi
+# die <exit-code> <stage> <message...>
+#   10 = files, 20 = nginx, 21 = certificate / certbot
+die() {
+    local code="$1" stage="$2"; shift 2
+    echo ""
+    fail "STAGE FAILED: $stage"
+    local line
+    for line in "$@"; do fail "$line"; done
+    printf '%b\n' "${RED}${BOLD}  ⛔  Auto-pilot STOPPED (exit $code). Later steps were NOT run.${NC}"
+    echo ""
+    exit "$code"
 }
 
-_nginx_write_new() {
-    local avail="$1"
-    [[ -f "$avail" ]] && warn "Config already exists — overwriting."
+# Runs the WHOLE-config test and keeps nginx's own exit status.
+# Do not pipe `nginx -t` into grep: with `set -o pipefail` the pipeline
+# inherits nginx's failure even when grep matches (root cause of YITP-0268).
+nginx_test() {
+    NGINX_TEST_OUTPUT="$(nginx -t ${NGINX_CONF:+-c "$NGINX_CONF"} 2>&1)"
+}
 
-    # Resolve PHP-FPM socket: prefer $PHP_VER, fall back to whatever is running
-    local fpm_sock=""
-    local _try_ver="$PHP_VER"
-    if [[ -S "/var/run/php/php${_try_ver}-fpm.sock" ]]; then
-        fpm_sock="/var/run/php/php${_try_ver}-fpm.sock"
+nginx_reload() { systemctl reload nginx; }
+
+# Prints the last test output. [warn] lines that belong to other vhosts
+# (fleet-wide "protocol options redefined" noise) are counted, not printed.
+_nginx_test_report() {
+    local warns=0 own_warns=""
+    warns="$(grep -c '\[warn\]' <<<"$NGINX_TEST_OUTPUT" || true)"
+    grep -v '\[warn\]' <<<"$NGINX_TEST_OUTPUT" | sed 's/^/        /' || true
+    own_warns="$(grep '\[warn\]' <<<"$NGINX_TEST_OUTPUT" | grep -F "/${DOMAIN}:" || true)"
+    [[ -n "$own_warns" ]] && sed 's/^/        /' <<<"$own_warns"
+    if (( warns > 0 )); then
+        info "$warns [warn] line(s) from the shared config not shown (warnings never fail the test)."
+    fi
+    return 0
+}
+
+# Certificate files referenced by a vhost file (ssl_certificate / _key).
+_nginx_cert_refs() {
+    awk '$1 ~ /^ssl_certificate(_key)?$/ { p=$2; sub(/;.*$/, "", p); gsub(/["'\'']/, "", p); print p }' "$1" | sort -u
+}
+
+# Subset of the above that nginx could not load right now.
+_nginx_missing_cert_refs() {
+    local p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        [[ -r "$p" && -s "$p" ]] || printf '%s\n' "$p"
+    done < <(_nginx_cert_refs "$1")
+}
+
+# _cert_state <domain> → prints exactly one of:
+#   valid            usable, covers <domain> + www.<domain>, not about to expire
+#   stale:<why>      nginx can load it, but it must be renewed / expanded
+#   missing          no lineage of any kind for this name
+#   broken:<why>     something exists but is unusable (dangling link, orphan, key mismatch)
+#   foreign:<list>   no live/<domain>, but live/<domain>-000N lineages exist
+_cert_state() {
+    local d="$1"
+    local live="$LE_DIR/live/$d"
+    local fc="$live/fullchain.pem" pk="$live/privkey.pem"
+
+    if [[ ! -e "$live" && ! -L "$live" ]]; then
+        local o others=""
+        for o in "$LE_DIR/live/${d}-"[0-9][0-9][0-9][0-9]; do
+            [[ -d "$o" ]] && others+="${others:+ }$o"
+        done
+        if [[ -n "$others" ]]; then echo "foreign:$others"; return; fi
+        if [[ -e "$LE_DIR/renewal/$d.conf" || -e "$LE_DIR/archive/$d" ]]; then
+            echo "broken:renewal/archive entries exist for $d but $live does not"; return
+        fi
+        echo "missing"; return
+    fi
+
+    [[ -r "$fc" && -s "$fc" ]] || { echo "broken:$fc is missing, empty or a dangling link"; return; }
+    [[ -r "$pk" && -s "$pk" ]] || { echo "broken:$pk is missing, empty or a dangling link"; return; }
+    openssl x509 -in "$fc" -noout 2>/dev/null || { echo "broken:$fc is not a readable certificate"; return; }
+
+    local cert_pub key_pub
+    cert_pub="$(openssl x509 -in "$fc" -noout -pubkey 2>/dev/null | openssl sha256)"
+    key_pub="$(openssl pkey -in "$pk" -pubout 2>/dev/null | openssl sha256)"
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || { echo "broken:private key does not match the certificate in $live"; return; }
+
+    local sans n
+    sans="$(openssl x509 -in "$fc" -noout -ext subjectAltName 2>/dev/null || true)"
+    for n in "$d" "www.$d"; do
+        if ! grep -qE "DNS:${n//./\\.}(,|[[:space:]]|\$)" <<<"$sans"; then
+            if [[ "$n" == "www.$d" ]] && grep -qE "DNS:\*\.${d//./\\.}(,|[[:space:]]|\$)" <<<"$sans"; then
+                continue
+            fi
+            echo "stale:certificate does not cover $n"; return
+        fi
+    done
+
+    if ! openssl x509 -in "$fc" -noout -checkend $(( CERT_MIN_DAYS * 86400 )) >/dev/null 2>&1; then
+        echo "stale:certificate is expired or expires within $CERT_MIN_DAYS days"; return
+    fi
+    echo "valid"
+}
+
+_cert_expiry() {
+    openssl x509 -in "$LE_DIR/live/$1/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2
+}
+
+# _nginx_install <candidate-file> <keep-backup:y|n>
+# Puts the candidate in place as this domain's vhost, enables it, tests the
+# whole nginx config and reloads. If the test or the reload fails, the
+# previous vhost file and the previous symlink state are restored and the
+# function returns 1 — the shared config is never left invalid.
+_nginx_install() {
+    local cand="$1" keep_backup="${2:-n}"
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local enabled="$NGINX_DIR/sites-enabled/$DOMAIN"
+    local had_avail=0 had_link=0 prev_link="" bak=""
+
+    if [[ -e "$enabled" && ! -L "$enabled" ]]; then
+        fail "$enabled is a regular file, not a symlink — move it out of sites-enabled first."
+        return 1
+    fi
+    if [[ -f "$avail" ]]; then
+        had_avail=1
+        bak="${avail}.autopilot-bak.$(date +%Y%m%d-%H%M%S)"
+        cp -p "$avail" "$bak"
+    fi
+    if [[ -L "$enabled" ]]; then
+        had_link=1
+        prev_link="$(readlink "$enabled")"
+    fi
+
+    cp "$cand" "$avail"
+    chmod 644 "$avail"
+    ln -sfn "$avail" "$enabled"
+
+    local why=""
+    if ! nginx_test; then
+        why="config test failed"
+    elif ! nginx_reload; then
+        why="config test passed but 'systemctl reload nginx' failed"
+    fi
+
+    if [[ -z "$why" ]]; then
+        if [[ -n "$bak" ]]; then
+            if [[ "$keep_backup" == "y" ]]; then
+                info "Previous vhost kept at: $bak"
+            else
+                rm -f "$bak"
+            fi
+        fi
+        return 0
+    fi
+
+    fail "Nginx: $why. Output:"
+    _nginx_test_report
+
+    if (( had_avail )); then cp -p "$bak" "$avail"; rm -f "$bak"; else rm -f "$avail"; fi
+    if (( had_link )); then ln -sfn "$prev_link" "$enabled"; else rm -f "$enabled"; fi
+
+    if nginx_test; then
+        if (( had_avail )); then
+            warn "Rolled back: previous $DOMAIN vhost restored. Shared Nginx config is valid."
+        else
+            warn "Rolled back: $DOMAIN vhost removed again (there was none before). Shared Nginx config is valid."
+        fi
     else
-        # Find first available socket from installed PHP-FPM versions
-        for _sock in /var/run/php/php*-fpm.sock; do
-            [[ -S "$_sock" ]] && fpm_sock="$_sock" && break
+        fail "ROLLBACK DID NOT RESTORE A VALID CONFIG — fix by hand before any nginx reload:"
+        _nginx_test_report
+    fi
+    return 1
+}
+
+_resolve_fpm_sock() {
+    local sock="" s
+    if [[ -S "/var/run/php/php${PHP_VER}-fpm.sock" ]]; then
+        sock="/var/run/php/php${PHP_VER}-fpm.sock"
+    else
+        for s in /var/run/php/php*-fpm.sock; do
+            [[ -S "$s" ]] && sock="$s" && break
         done
     fi
-
-    if [[ -z "$fpm_sock" ]]; then
-        warn "No PHP-FPM socket found — defaulting to php${_try_ver}-fpm.sock (may need fixing)."
-        fpm_sock="/var/run/php/php${_try_ver}-fpm.sock"
-    else
-        info "PHP-FPM socket: $fpm_sock"
+    if [[ -z "$sock" ]]; then
+        warn "No PHP-FPM socket found — defaulting to php${PHP_VER}-fpm.sock (may need fixing)." >&2
+        sock="/var/run/php/php${PHP_VER}-fpm.sock"
     fi
+    printf '%s' "$sock"
+}
 
-    info "Writing: $avail"
-    cat > "$avail" <<EOF
+# Plain HTTP vhost. It is the final config for SKIP_CERTBOT runs and the
+# bootstrap config while a certificate is being issued.
+_nginx_write_new() {
+    local dst="$1"
+    local fpm_sock; fpm_sock="$(_resolve_fpm_sock)"
+
+    cat > "$dst" <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -715,88 +852,435 @@ server {
     }
 }
 EOF
-    ok "Nginx config written (PHP-FPM: ${fpm_sock})."
 }
 
-_cleanup_certbot_injections() {
-    local own_avail; own_avail="$(readlink -f "/etc/nginx/sites-available/$DOMAIN" 2>/dev/null)"
-    for cfg in /etc/nginx/sites-enabled/*; do
-        local real_cfg; real_cfg="$(readlink -f "$cfg" 2>/dev/null || echo "$cfg")"
-        [[ "$real_cfg" == "$own_avail" ]] && continue
-        grep -q "server_name[[:space:]].*\b${DOMAIN}\b" "$real_cfg" 2>/dev/null || continue
-        warn "Certbot injected '$DOMAIN' block into $(basename "$real_cfg") — removing..."
-        python3 - "$real_cfg" "$DOMAIN" <<'PYEOF'
-import sys
+# HTTPS vhost for a site that has no source config to inherit from.
+# Listener form `listen 443 ssl;` matches the fleet majority, so this
+# template adds no new "protocol options redefined" warning.
+_nginx_write_https() {
+    local dst="$1"
+    local fpm_sock; fpm_sock="$(_resolve_fpm_sock)"
+    local ssl_extra=""
+    [[ -f "$LE_DIR/options-ssl-nginx.conf" ]] && ssl_extra+="    include $LE_DIR/options-ssl-nginx.conf;"$'\n'
+    [[ -f "$LE_DIR/ssl-dhparams.pem" ]]       && ssl_extra+="    ssl_dhparam $LE_DIR/ssl-dhparams.pem;"$'\n'
 
-filepath, domain = sys.argv[1], sys.argv[2]
-with open(filepath) as f:
-    content = f.read()
+    cat > "$dst" <<EOF
+# ── HTTP → HTTPS redirect ─────────────────────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN www.$DOMAIN;
 
-def strip_domain_blocks(text, domain):
-    out, i = [], 0
-    while i < len(text):
-        idx = text.find('server', i)
-        if idx == -1:
-            out.append(text[i:]); break
-        brace = text.find('{', idx)
-        if brace == -1:
-            out.append(text[i:]); break
-        # skip non-server-block 'server' occurrences
-        between = text[idx+6:brace]
-        if between.strip() and not between.strip() == '':
-            non_ws = between.strip()
-            if non_ws and non_ws[0] not in ('{', '\n', '\r', ' ', '\t'):
-                out.append(text[i:idx+1]); i = idx+1; continue
-        out.append(text[i:idx])
-        depth, j = 0, brace
-        while j < len(text):
-            c = text[j]
-            if c == '{': depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    block = text[idx:j+1]
-                    if domain not in block:
-                        out.append(block)
-                    i = j + 1; break
-            j += 1
-        else:
-            out.append(text[i:]); break
-    return ''.join(out).rstrip() + '\n'
+    access_log /var/log/nginx/${DOMAIN}-http.access.log;
+    error_log  /var/log/nginx/${DOMAIN}-http.error.log;
 
-result = strip_domain_blocks(content, domain)
-with open(filepath, 'w') as f:
-    f.write(result)
-PYEOF
-        ok "Removed stray certbot block from $(basename "$real_cfg")"
-    done
-    nginx -t &>/dev/null && systemctl reload nginx || true
+    return 301 https://\$host\$request_uri;
+}
+
+# ── HTTPS ─────────────────────────────────────────────────
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $DOMAIN www.$DOMAIN;
+    root $WEB_ROOT;
+    index index.php index.html index.htm;
+
+    ssl_certificate     $LE_DIR/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key $LE_DIR/live/$DOMAIN/privkey.pem;
+${ssl_extra}
+    access_log /var/log/nginx/${DOMAIN}.access.log;
+    error_log  /var/log/nginx/${DOMAIN}.error.log;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${fpm_sock};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+}
+
+# _nginx_adapt_from_source <source-vhost> <dest-file>
+# Rewrites every source-domain reference to the new domain. Includes that
+# are named after the source site (e.g. its 404-redirect map) are disabled,
+# not inherited. Returns 1 if anything of the source site is still active.
+_nginx_adapt_from_source() {
+    local src="$1" dst="$2"
+    local src_re="${SRC_DOMAIN//./\\.}"
+    # Name boundaries: a leading hyphen/letter means another host name
+    # (my-src.com); a trailing hyphen does not (src.com-backend.access.log).
+    local b='[^A-Za-z0-9-]' e='[^A-Za-z0-9]'
+    local marker='[autopilot] source-site include not inherited:'
+
+    sed -E \
+        -e "/^[[:space:]]*include[[:space:]].*${src_re}/s|^([[:space:]]*)(include.*)\$|\\1# ${marker} \\2|" \
+        -e "/autopilot\\] source-site include/!s|server_name [^;]*;|server_name $DOMAIN www.$DOMAIN;|g" \
+        -e "/autopilot\\] source-site include/!s|root [^;]*;|root $WEB_ROOT;|g" \
+        -e "/autopilot\\] source-site include/!s#(^|${b})${src_re}(\$|${e})#\\1${DOMAIN}\\2#g" \
+        -e "/autopilot\\] source-site include/!s#(^|${b})${src_re}(\$|${e})#\\1${DOMAIN}\\2#g" \
+        "$src" > "$dst"
+
+    if [[ -n "$SRC_WEB_ROOT" && "$SRC_WEB_ROOT" != "$WEB_ROOT" ]]; then
+        sed -i -E "s#${SRC_WEB_ROOT//./\\.}(\$|[/;\"' ])#${WEB_ROOT}\\1#g" "$dst"
+    fi
+
+    local disabled
+    disabled="$(grep -F "$marker" "$dst" || true)"
+    if [[ -n "$disabled" ]]; then
+        warn "Source-site includes were NOT inherited (create $DOMAIN equivalents if needed):"
+        sed -E 's/^[[:space:]]*/        /' <<<"$disabled"
+    fi
+
+    local leaks
+    leaks="$(grep -nE "(^|${b})${src_re}(\$|${e})" "$dst" | grep -vF "$marker" || true)"
+    if [[ -n "$SRC_WEB_ROOT" && "$SRC_WEB_ROOT" != "$WEB_ROOT" ]]; then
+        leaks+="$(grep -nE "${SRC_WEB_ROOT//./\\.}(\$|[/;\"' ])" "$dst" || true)"
+    fi
+    if [[ -n "$leaks" ]]; then
+        fail "Adapted config still references the source site:"
+        sed 's/^/        /' <<<"$leaks"
+        return 1
+    fi
+    return 0
+}
+
+exec_nginx() {
+    section "2/7" "NGINX"
+
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local pending="${avail}.ssl-pending"
+
+    # ── Baseline: the shared config must be valid before we touch it ──
+    info "Baseline Nginx config test (before any change)..."
+    if ! nginx_test; then
+        _nginx_test_report
+        die 20 "NGINX (baseline test)" \
+            "The shared Nginx config was already invalid before this run changed anything." \
+            "Nothing was written. Fix the error above, then re-run."
+    fi
+    ok "Baseline config test passed."
+
+    # ── Certificate state decides which vhost can be enabled now ──
+    local cstate; cstate="$(_cert_state "$DOMAIN")"
+    case "$cstate" in
+        valid)    ok   "Certificate for $DOMAIN already exists and is valid (expires: $(_cert_expiry "$DOMAIN"))." ;;
+        stale:*)  warn "Certificate for $DOMAIN exists but needs renewal: ${cstate#stale:}" ;;
+        missing)  info "No certificate for $DOMAIN yet — HTTP bootstrap first, HTTPS after issuance." ;;
+        broken:*|foreign:*)
+            if [[ "${SKIP_CERTBOT,,}" != "y" ]]; then
+                die 21 "CERTIFICATE (preflight)" \
+                    "Unexpected certificate state for $DOMAIN: ${cstate}" \
+                    "Not creating or overwriting a lineage blindly. Inspect: certbot certificates ; ls -la $LE_DIR/live/" \
+                    "Then either repair it, or remove it (certbot delete --cert-name <name>) and re-run. Nothing was written."
+            fi
+            warn "Certificate state for $DOMAIN: ${cstate} (Certbot skipped — staying on HTTP)."
+            ;;
+    esac
+
+    # ── Build the intended vhost in a temp file (never loaded by nginx) ──
+    local gen; gen="$(mktemp "${avail}.gen.XXXXXX")"
+    local src_conf="$NGINX_DIR/sites-available/$SRC_DOMAIN"
+    if [[ "$MODE" == "copy" && -f "$src_conf" ]]; then
+        info "Copying config: $SRC_DOMAIN → $DOMAIN ..."
+        if ! _nginx_adapt_from_source "$src_conf" "$gen"; then
+            rm -f "$gen"
+            die 20 "NGINX (adapt source config)" \
+                "The config copied from $SRC_DOMAIN could not be fully rewritten for $DOMAIN." \
+                "Nothing was installed; $SRC_DOMAIN is untouched."
+        fi
+        ok "Config copied and adapted from $SRC_DOMAIN."
+    else
+        [[ "$MODE" == "copy" ]] && warn "Source config not found ($src_conf) — creating fresh config."
+        _nginx_write_new "$gen"
+        ok "Fresh HTTP config generated."
+    fi
+
+    # ── Does the intended vhost need certificate files that do not exist? ──
+    local missing_refs; missing_refs="$(_nginx_missing_cert_refs "$gen")"
+    local to_install="$gen" bootstrap=""
+    if [[ -n "$missing_refs" ]]; then
+        local ref
+        while IFS= read -r ref; do
+            if [[ "$ref" != "$LE_DIR/live/$DOMAIN/"* ]]; then
+                rm -f "$gen"
+                die 20 "NGINX (certificate paths)" \
+                    "The generated config references a certificate file that does not exist and is not $DOMAIN's own: $ref" \
+                    "Nothing was installed."
+            fi
+        done <<<"$missing_refs"
+
+        warn "The HTTPS config needs a certificate that is not issued yet:"
+        sed 's/^/        /' <<<"$missing_refs"
+        warn "Switching to HTTP BOOTSTRAP: enabling a temporary HTTP-only vhost now."
+        mv "$gen" "$pending"; chmod 644 "$pending"
+        info "Final HTTPS config parked (not loaded by nginx): $pending"
+        bootstrap="$(mktemp "${avail}.gen.XXXXXX")"
+        _nginx_write_new "$bootstrap"
+        to_install="$bootstrap"
+    else
+        # A parked config from an earlier interrupted run is obsolete now.
+        rm -f "$pending"
+    fi
+
+    info "Testing Nginx config..."
+    if ! _nginx_install "$to_install" y; then
+        rm -f "$gen" "$bootstrap"
+        die 20 "NGINX (config test)" \
+            "The new $DOMAIN vhost was rejected and has been rolled back." \
+            "Fix the cause shown above, then re-run."
+    fi
+    rm -f "$gen" "$bootstrap"
+
+    if [[ -f "$pending" ]]; then
+        ok "Nginx reloaded — $DOMAIN live on the temporary HTTP bootstrap config."
+    elif [[ -n "$(_nginx_cert_refs "$avail")" ]]; then
+        ok "Nginx reloaded — $DOMAIN live with its HTTPS config (existing certificate)."
+    else
+        ok "Nginx reloaded — $DOMAIN live on HTTP."
+    fi
+}
+
+# Advisory checks before spending a Let's Encrypt validation attempt.
+_acme_preflight() {
+    if [[ "${AUTOPILOT_SKIP_DNS_CHECK:-0}" == "1" ]]; then
+        info "DNS / reachability preflight skipped (AUTOPILOT_SKIP_DNS_CHECK=1)."
+        return 0
+    fi
+
+    if command -v dig &>/dev/null; then
+        local n ans
+        for n in "$DOMAIN" "www.$DOMAIN"; do
+            ans="$(dig +short A "$n" 2>/dev/null | tail -1)"
+            [[ -n "$ans" ]] || ans="$(dig +short AAAA "$n" 2>/dev/null | tail -1)"
+            if [[ -z "$ans" ]]; then
+                die 21 "CERTBOT (DNS preflight)" \
+                    "$n does not resolve (no A/AAAA record). The ACME HTTP-01 challenge cannot succeed." \
+                    "$DOMAIN stays on its current valid Nginx config. Create the DNS record, then run: autopilot --resume-ssl $DOMAIN"
+            fi
+            ok "DNS: $n → $ans"
+        done
+    else
+        info "dig not available — DNS preflight skipped."
+    fi
+
+    # Reachability probe: fetch a token through the public name, the way
+    # Let's Encrypt will. Advisory only (a CDN may answer differently).
+    if [[ -n "$WEB_ROOT" && -d "$WEB_ROOT" ]]; then
+        local dir="$WEB_ROOT/.well-known/acme-challenge" token got made_dir=0
+        token="autopilot-probe-$$-$RANDOM"
+        [[ -d "$dir" ]] || { mkdir -p "$dir" && made_dir=1; }
+        printf '%s' "$token" > "$dir/$token"
+        chmod -R a+rX "$WEB_ROOT/.well-known" 2>/dev/null || true
+        got="$(curl -sL --max-time 10 "http://$DOMAIN/.well-known/acme-challenge/$token" 2>/dev/null || true)"
+        rm -f "$dir/$token"
+        (( made_dir )) && rmdir "$dir" "$WEB_ROOT/.well-known" 2>/dev/null
+        if [[ "$got" == "$token" ]]; then
+            ok "Reachability: http://$DOMAIN/.well-known/acme-challenge/ serves this server's web root."
+        else
+            warn "Reachability probe did not return the token over http://$DOMAIN — issuance may fail (DNS not pointing here, or a proxy redirect)."
+        fi
+    fi
+    return 0
+}
+
+# Swap the final HTTPS vhost in once a valid certificate exists.
+_nginx_activate_https() {
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local pending="${avail}.ssl-pending"
+    local cand="" tmp=""
+
+    if [[ -f "$pending" ]]; then
+        cand="$pending"
+        info "Activating the parked HTTPS config: $pending"
+    elif [[ -z "$(_nginx_cert_refs "$avail")" ]]; then
+        if [[ "${ENABLE_VARNISH,,}" == "y" ]]; then
+            info "HTTPS front door will be written by the Varnish step (6/7)."
+            return 0
+        fi
+        tmp="$(mktemp "${avail}.gen.XXXXXX")"
+        _nginx_write_https "$tmp"
+        cand="$tmp"
+        info "Activating HTTPS config for $DOMAIN (HTTP → HTTPS redirect + :443)."
+    else
+        ok "HTTPS config already active for $DOMAIN."
+        return 0
+    fi
+
+    local still_missing; still_missing="$(_nginx_missing_cert_refs "$cand")"
+    if [[ -n "$still_missing" ]]; then
+        rm -f "$tmp"
+        die 21 "NGINX (HTTPS activation)" \
+            "Certificate files referenced by the HTTPS config are still missing: $(tr '\n' ' ' <<<"$still_missing")" \
+            "$DOMAIN stays on its current valid config. HTTPS config kept at: $pending"
+    fi
+
+    if ! _nginx_install "$cand" n; then
+        rm -f "$tmp"
+        die 20 "NGINX (HTTPS activation)" \
+            "The HTTPS config was rejected; the HTTP bootstrap config was restored and stays live." \
+            "HTTPS config kept for inspection at: $pending — fix it, then run: autopilot --resume-ssl $DOMAIN"
+    fi
+    rm -f "$tmp" "$pending"
+    ok "HTTPS config active — Nginx reloaded."
 }
 
 exec_certbot() {
     section "3/7" "CERTBOT SSL"
 
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local pending="${avail}.ssl-pending"
+
     if [[ "${SKIP_CERTBOT,,}" == "y" ]]; then
         warn "Certbot SKIPPED (as requested)."
-        return
+        if [[ -f "$pending" ]]; then
+            warn "$DOMAIN stays on the temporary HTTP config. Finish later with: autopilot --resume-ssl $DOMAIN"
+        fi
+        return 0
     fi
 
-    if ! command -v certbot &>/dev/null; then
-        warn "certbot not found. Install: apt install certbot python3-certbot-nginx"
-        warn "Then run: certbot --nginx -d $DOMAIN -d www.$DOMAIN"
-        return
+    local cstate; cstate="$(_cert_state "$DOMAIN")"
+    case "$cstate" in
+        valid)
+            ok "Existing certificate is valid (expires: $(_cert_expiry "$DOMAIN")) — not re-issuing."
+            ;;
+        broken:*|foreign:*)
+            die 21 "CERTIFICATE (state check)" \
+                "Unexpected certificate state for $DOMAIN: ${cstate}" \
+                "Not creating or overwriting a lineage blindly. Inspect: certbot certificates ; ls -la $LE_DIR/live/"
+            ;;
+        missing|stale:*)
+            if ! command -v "$CERTBOT_BIN" &>/dev/null; then
+                die 21 "CERTBOT (not installed)" \
+                    "certbot not found. Install: apt install certbot python3-certbot-nginx" \
+                    "Then run: autopilot --resume-ssl $DOMAIN"
+            fi
+            if [[ "$cstate" == stale:* && ! -f "$LE_DIR/renewal/$DOMAIN.conf" ]]; then
+                die 21 "CERTIFICATE (state check)" \
+                    "$LE_DIR/live/$DOMAIN needs renewal (${cstate#stale:}) but has no renewal config — not a Certbot-managed lineage." \
+                    "Replace it by hand; this script will not overwrite it."
+            fi
+            if ! nginx_test; then
+                _nginx_test_report
+                die 20 "NGINX (pre-issuance test)" \
+                    "The Nginx config is invalid, so the Certbot nginx authenticator cannot run."
+            fi
+            _acme_preflight
+
+            local certbot_email="${EMAIL_PREFIX}@${DOMAIN}"
+            info "Issuing SSL for $DOMAIN + www.$DOMAIN (HTTP-01 via nginx authenticator, contact: $certbot_email) ..."
+            # certonly: Certbot proves control through nginx but never edits
+            # vhosts. --cert-name pins the lineage to live/$DOMAIN (no -0001).
+            if ! "$CERTBOT_BIN" certonly --nginx --cert-name "$DOMAIN" \
+                    -d "$DOMAIN" -d "www.$DOMAIN" \
+                    --non-interactive --agree-tos -m "$certbot_email" \
+                    --keep-until-expiring --expand; then
+                if nginx_test; then
+                    info "Shared Nginx config is still valid; $DOMAIN stays on its current config."
+                else
+                    fail "Nginx config is INVALID after the Certbot failure:"
+                    _nginx_test_report
+                fi
+                die 21 "CERTBOT (issuance)" \
+                    "Let's Encrypt did not issue a certificate for $DOMAIN / www.$DOMAIN." \
+                    "Details: /var/log/letsencrypt/letsencrypt.log" \
+                    "After fixing DNS / reachability run: autopilot --resume-ssl $DOMAIN"
+            fi
+
+            cstate="$(_cert_state "$DOMAIN")"
+            if [[ "$cstate" != "valid" ]]; then
+                die 21 "CERTBOT (post-issuance verification)" \
+                    "Certbot reported success but the certificate is not usable: ${cstate}"
+            fi
+            ok "SSL certificate issued and verified (covers $DOMAIN + www.$DOMAIN, expires: $(_cert_expiry "$DOMAIN"))."
+            ;;
+    esac
+
+    _nginx_activate_https
+}
+
+# autopilot --resume-ssl <domain>
+# Finishes (or repairs) the certificate + HTTPS activation for a vhost that
+# already exists: interrupted run, issuance failure, DNS that was not ready,
+# or the pre-fix state where the vhost references a missing certificate and
+# its sites-enabled symlink was removed.
+resume_ssl() {
+    DOMAIN="${1:-}"
+    DOMAIN="${DOMAIN#www.}"; DOMAIN="${DOMAIN%/}"
+    if [[ -z "$DOMAIN" ]]; then
+        fail "Usage: autopilot --resume-ssl <domain>"
+        exit 2
+    fi
+    SKIP_CERTBOT="n"
+
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local enabled="$NGINX_DIR/sites-enabled/$DOMAIN"
+    local pending="${avail}.ssl-pending"
+
+    section "RESUME" "SSL for $DOMAIN"
+
+    [[ -f "$avail" ]] || die 20 "RESUME (preflight)" \
+        "No vhost at $avail — run the full launcher instead."
+
+    info "Baseline Nginx config test (before any change)..."
+    if ! nginx_test; then
+        _nginx_test_report
+        die 20 "NGINX (baseline test)" \
+            "The shared Nginx config is already invalid. Nothing was changed."
+    fi
+    ok "Baseline config test passed."
+
+    local probe="$avail"
+    [[ -f "$pending" ]] && probe="$pending"
+    WEB_ROOT="$(awk '$1=="root" { p=$2; sub(/;.*$/, "", p); print p; exit }' "$probe")"
+    [[ -n "$WEB_ROOT" ]] || die 20 "RESUME (preflight)" "Could not read a 'root' directive from $probe."
+    if grep -q '127\.0\.0\.1:6081' "$probe"; then ENABLE_VARNISH="y"; fi
+    info "Web root: $WEB_ROOT"
+
+    # Disabled vhost that references a certificate that does not exist:
+    # park it and enable the HTTP bootstrap instead.
+    local missing_refs; missing_refs="$(_nginx_missing_cert_refs "$avail")"
+    if [[ -n "$missing_refs" ]]; then
+        local ref
+        while IFS= read -r ref; do
+            [[ "$ref" == "$LE_DIR/live/$DOMAIN/"* ]] || die 20 "RESUME (certificate paths)" \
+                "$avail references a missing certificate that is not $DOMAIN's own: $ref"
+        done <<<"$missing_refs"
+        warn "$avail references a certificate that does not exist — parking it and enabling the HTTP bootstrap."
+        cp -p "$avail" "$pending"
+        local bootstrap; bootstrap="$(mktemp "${avail}.gen.XXXXXX")"
+        _nginx_write_new "$bootstrap"
+        if ! _nginx_install "$bootstrap" n; then
+            rm -f "$bootstrap"
+            die 20 "NGINX (HTTP bootstrap)" "The HTTP bootstrap config was rejected and rolled back."
+        fi
+        rm -f "$bootstrap"
+        ok "HTTP bootstrap enabled."
+    elif [[ ! -L "$enabled" ]]; then
+        warn "$DOMAIN vhost exists but is not enabled — enabling it."
+        local same; same="$(mktemp "${avail}.gen.XXXXXX")"
+        cp -p "$avail" "$same"
+        if ! _nginx_install "$same" n; then
+            rm -f "$same"
+            die 20 "NGINX (enable vhost)" "The existing vhost was rejected; it stays disabled."
+        fi
+        rm -f "$same"
+        ok "Vhost enabled."
     fi
 
-    local certbot_email="${EMAIL_PREFIX}@${DOMAIN}"
-    info "Issuing SSL for $DOMAIN + www.$DOMAIN (contact: $certbot_email) ..."
-    if certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --redirect \
-        --non-interactive --agree-tos -m "$certbot_email"; then
-        ok "SSL certificate issued and Nginx updated with HTTPS redirect!"
-    else
-        warn "Certbot had issues — run manually: certbot --nginx -d $DOMAIN -d www.$DOMAIN"
-    fi
+    exec_certbot
 
-    _cleanup_certbot_injections
+    echo ""
+    printf '%b\n' "${GREEN}${BOLD}  🔒  SSL resume complete → $DOMAIN${NC}"
+    echo ""
 }
 
 exec_database() {
@@ -1266,16 +1750,28 @@ exec_varnish() {
         return
     fi
 
-    local avail="/etc/nginx/sites-available/$DOMAIN"
-    local enabled="/etc/nginx/sites-enabled/$DOMAIN"
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local enabled="$NGINX_DIR/sites-enabled/$DOMAIN"
 
-    info "Backing up current Nginx config → ${avail}.pre-varnish.bak"
-    [[ -f "$avail" ]] && cp "$avail" "${avail}.pre-varnish.bak"
-
-    local cert_path="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    local key_path="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    local cert_path="$LE_DIR/live/$DOMAIN/fullchain.pem"
+    local key_path="$LE_DIR/live/$DOMAIN/privkey.pem"
     local certs_exist=0
     [[ -f "$cert_path" && -f "$key_path" ]] && certs_exist=1
+
+    # A config copied from a Varnish-fronted source already has the
+    # :8080 backend + :443 → :6081 front door (with the source's snippets
+    # and headers). Keep it instead of flattening it to the generic template.
+    local keep_existing=0
+    if [[ -f "$avail" ]] && grep -qE '^[[:space:]]*listen[[:space:]]+8080' "$avail" \
+        && grep -q '127\.0\.0\.1:6081' "$avail"; then
+        keep_existing=1
+    fi
+
+    if [[ "$keep_existing" -eq 1 ]]; then
+        ok "Nginx config already has the Varnish architecture (inherited) — keeping it."
+    else
+    info "Backing up current Nginx config → ${avail}.pre-varnish.bak"
+    [[ -f "$avail" ]] && cp "$avail" "${avail}.pre-varnish.bak"
 
     if [[ "$certs_exist" -eq 1 ]]; then
         info "Writing Varnish architecture (backend :8080, HTTPS :443 → Varnish :6081) ..."
@@ -1387,6 +1883,7 @@ server {
 EOF
     fi
     ok "Varnish Nginx config written."
+    fi
 
     local wp_config="$WEB_ROOT/wp-config.php"
     if [[ -f "$wp_config" ]] && ! grep -q "HTTP_X_FORWARDED_PROTO" "$wp_config"; then
@@ -1412,9 +1909,24 @@ EOF
     systemctl restart varnish
     systemctl is-active --quiet varnish && ok "Varnish is running." || warn "Varnish may not be running — check: systemctl status varnish"
 
-    [[ -L "$enabled" || -f "$enabled" ]] && rm -f "$enabled"
-    ln -s "$avail" "$enabled"
-    nginx -t 2>&1 && systemctl reload nginx && ok "Nginx reloaded with Varnish config."
+    ln -sfn "$avail" "$enabled"
+    if nginx_test && nginx_reload; then
+        ok "Nginx reloaded with Varnish config."
+    else
+        fail "Nginx rejected the Varnish config:"
+        _nginx_test_report
+        if [[ "$keep_existing" -eq 0 && -f "${avail}.pre-varnish.bak" ]]; then
+            cp -p "${avail}.pre-varnish.bak" "$avail"
+            if nginx_test && nginx_reload; then
+                warn "Restored the pre-Varnish config (${avail}.pre-varnish.bak) — shared Nginx config is valid."
+            else
+                fail "Restoring the pre-Varnish config did NOT give a valid config:"
+                _nginx_test_report
+            fi
+        fi
+        die 20 "VARNISH (nginx config test)" \
+            "The Varnish vhost for $DOMAIN was rejected. Fix the error above, then re-run."
+    fi
 
     sleep 2
     local headers
@@ -1462,28 +1974,26 @@ exec_audit() {
 
     # ── Nginx ────────────────────────────────────────────────
     printf '%b\n' "\n${BOLD}  [NGINX]${NC}"
-    local avail="/etc/nginx/sites-available/$DOMAIN"
-    local enabled="/etc/nginx/sites-enabled/$DOMAIN"
+    local avail="$NGINX_DIR/sites-available/$DOMAIN"
+    local enabled="$NGINX_DIR/sites-enabled/$DOMAIN"
     [[ -f "$avail" ]]   && ok "Config exists : $avail"   || { fail "Config MISSING : $avail";   all_ok=0; }
     [[ -L "$enabled" ]] && ok "Symlink active: $enabled"  || { fail "Symlink MISSING: $enabled"; all_ok=0; }
-    nginx -t 2>&1 | grep -q "successful" && ok "Nginx syntax OK" || { fail "Nginx config FAILED"; all_ok=0; }
+    if nginx_test; then ok "Nginx syntax OK"; else fail "Nginx config FAILED"; _nginx_test_report; all_ok=0; fi
+    [[ -f "${avail}.ssl-pending" ]] && { warn "HTTPS config still parked: ${avail}.ssl-pending — run: autopilot --resume-ssl $DOMAIN"; all_ok=0; }
 
     # ── SSL / Certbot ────────────────────────────────────────
     printf '%b\n' "\n${BOLD}  [SSL / CERTBOT]${NC}"
     if [[ "${SKIP_CERTBOT,,}" == "y" ]]; then
         info "Certbot was skipped."
-    elif command -v certbot &>/dev/null; then
-        if certbot certificates 2>/dev/null | grep -q "$DOMAIN"; then
-            ok "SSL certificate: found for $DOMAIN"
-            local expiry
-            expiry="$(certbot certificates 2>/dev/null | grep -A8 "Domains:.*${DOMAIN}" | grep "Expiry Date" | awk '{print $3,$4}' | head -1)"
-            [[ -n "$expiry" ]] && info "Expires: $expiry"
+    else
+        local audit_cstate; audit_cstate="$(_cert_state "$DOMAIN")"
+        if [[ "$audit_cstate" == "valid" ]]; then
+            ok "SSL certificate: valid for $DOMAIN + www.$DOMAIN"
+            info "Expires: $(_cert_expiry "$DOMAIN")"
         else
-            warn "No SSL cert for $DOMAIN — run: certbot --nginx -d $DOMAIN -d www.$DOMAIN"
+            warn "SSL certificate for $DOMAIN: ${audit_cstate} — run: autopilot --resume-ssl $DOMAIN"
             all_ok=0
         fi
-    else
-        warn "certbot not installed."
     fi
 
     # ── HTTP response ────────────────────────────────────────
@@ -2160,6 +2670,18 @@ exec_restore_verify() {
 # ============================================================
 
 main() {
+    case "${1:-}" in
+        --resume-ssl)
+            resume_ssl "${2:-}"
+            exit 0
+            ;;
+        -h|--help)
+            echo "Usage: autopilot                       interactive launcher (new / copy / delete / restore)"
+            echo "       autopilot --resume-ssl <domain> finish or repair certificate + HTTPS for an existing vhost"
+            exit 0
+            ;;
+    esac
+
     print_header
     check_mysql_health
 
@@ -2246,4 +2768,7 @@ main() {
     echo ""
 }
 
-main "$@"
+# Allow `source autopilot.sh` (tests) without launching the wizard.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

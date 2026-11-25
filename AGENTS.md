@@ -73,8 +73,8 @@ Phase 1 collects all inputs interactively, Phase 2 executes silently.
 
 ### What it does (in order)
 1. **Files** — create web root or rsync from source domain
-2. **Nginx** — write nginx config; falls back to HTTP-only if SSL cert missing
-3. **Certbot** — `certbot --nginx --non-interactive --agree-tos -m <email>` using `EMAIL_PREFIX@DOMAIN`
+2. **Nginx** — baseline `nginx -t`, then install the vhost. If the intended vhost needs a certificate that does not exist yet, it is parked as `sites-available/<domain>.ssl-pending` and an HTTP-only bootstrap vhost is enabled instead
+3. **Certbot** — `certbot certonly --nginx --cert-name <domain> -d <domain> -d www.<domain>` (HTTP-01, nginx authenticator, no installer: Certbot never edits vhosts), verify the issued files, then swap the parked HTTPS vhost in
 4. **Database** — create MySQL DB + user, or clone from source
 5. **Email** — create postfix virtual mailbox + dovecot passwdfile entry
 6. **Varnish** — write Varnish nginx config (checks certs exist before writing SSL block)
@@ -98,6 +98,50 @@ Phase 1 collects all inputs interactively, Phase 2 executes silently.
 DB_USER=missiria DB_PASS=xxx MYSQL_ADMIN_PASS=yyy ./autopilot.sh
 ```
 
+### Nginx / SSL bootstrap (YITP-0268)
+
+**Order for a domain with no certificate:** baseline test → HTTP bootstrap vhost (final HTTPS vhost parked as `.ssl-pending`) → DNS + reachability preflight → `certbot certonly --nginx` → verify cert (files readable, key matches, covers apex + www, not expiring) → swap HTTPS vhost in → test → reload.
+
+**Prerequisites:** A/AAAA records for `<domain>` and `www.<domain>` reach this server on port 80 (directly or through a proxy that passes `/.well-known/acme-challenge/`). A name that does not resolve stops the run before any ACME attempt.
+
+**Rules the script enforces**
+- Every vhost change goes through `_nginx_install`: whole-config `nginx -t` before reload; on failure the previous vhost file and symlink state are restored (or the new file removed if there was none). A replaced pre-existing vhost is kept as `<domain>.autopilot-bak.<timestamp>`.
+- Any nginx or certificate failure stops the run with a nonzero exit and names the stage. Later steps (DB, email, Varnish, audit) do not run.
+
+| Exit | Stage |
+|------|-------|
+| 10 | Files (source root missing, rsync failed) |
+| 20 | Nginx (baseline invalid, adapted config rejected, HTTPS activation rejected, Varnish vhost rejected) |
+| 21 | Certificate (unexpected lineage state, DNS preflight, issuance failed, post-issuance verification) |
+
+- Existing valid certificate → not re-issued; the HTTPS vhost is enabled directly.
+- `live/<domain>` with dangling links, a `live/<domain>-0001` lineage, or orphan renewal/archive entries → stop (exit 21). The script never creates or overwrites a lineage blindly, and never borrows another site's certificate.
+- Copy mode rewrites every source-domain reference (server_name, root, cert paths, logs, Certbot `if ($host = …)` blocks). Includes named after the source site (e.g. `404-redirects-<source>.conf`) are commented out with `# [autopilot] source-site include not inherited:`. If anything of the source is still active, the step fails.
+- Varnish step keeps a config that already has the `:8080` backend + `:6081` front door (inherited from the source) instead of replacing it with the generic template.
+
+**Re-run / recovery**
+```bash
+# Finish or repair cert + HTTPS for a vhost that already exists
+# (issuance failed, DNS was not ready, run interrupted, SKIP_CERTBOT earlier):
+autopilot --resume-ssl domain.com
+```
+`--resume-ssl` also repairs the pre-fix leftover state — vhost in `sites-available` pointing at a missing certificate with its `sites-enabled` symlink removed: it parks that vhost as `.ssl-pending`, enables the HTTP bootstrap, issues, then activates HTTPS.
+
+Manual equivalents if the script cannot be used:
+```bash
+nginx -t                                            # must pass first
+ls -la /etc/nginx/sites-available/domain.com*       # .ssl-pending = parked HTTPS vhost
+certbot certificates | grep -A6 domain.com          # lineage state
+certbot certonly --nginx --cert-name domain.com -d domain.com -d www.domain.com
+cp /etc/nginx/sites-available/domain.com.ssl-pending /etc/nginx/sites-available/domain.com
+ln -sfn /etc/nginx/sites-available/domain.com /etc/nginx/sites-enabled/domain.com
+nginx -t && systemctl reload nginx
+```
+
+**Tests:** `bash batches/tests/autopilot-ssl-bootstrap.test.sh` — sandbox nginx prefix + stub certbot, real `nginx -t`; never touches `/etc/nginx` or reloads the live server.
+
+**"protocol options redefined for 0.0.0.0:443" warnings** — separate from certificate errors and never fatal. Cause: vhosts sharing the `:443` socket declare different listen options (`listen 443 ssl;` in most vhosts, `listen 443 ssl http2;` in a few). The autopilot HTTPS template uses `listen 443 ssl;` (fleet majority) so it adds none; a copied vhost keeps the source's listener form. Removing the existing warnings means aligning the `http2` vhosts with the rest — a fleet change, not part of provisioning.
+
 ---
 
 ## Common operations
@@ -105,18 +149,9 @@ DB_USER=missiria DB_PASS=xxx MYSQL_ADMIN_PASS=yyy ./autopilot.sh
 ### Re-issue SSL cert (chicken-and-egg fix)
 When nginx config already has SSL cert paths but cert doesn't exist:
 ```bash
-# 1. Temporarily disable SSL server block in sites-available/<domain>
-# 2. Add plain port-80 server block
-nginx -t && systemctl reload nginx
-
-# 3. Issue cert
-certbot --nginx -d domain.com -d www.domain.com \
-  --non-interactive --agree-tos -m contact@domain.com
-
-# 4. Verify certbot wrote SSL to correct block (not 8080 backend)
-# 5. If Varnish: restore proper 8080+443 config
-nginx -t && systemctl reload nginx
+autopilot --resume-ssl domain.com
 ```
+See "Nginx / SSL bootstrap" above for what it does and the manual equivalent.
 
 ### Add new domain
 ```bash
@@ -144,8 +179,9 @@ nginx -t && systemctl reload nginx
 
 ## Known gotchas
 
-- **Certbot injects SSL into first matching server block** — when multiple blocks exist for same domain, it may inject into wrong one (e.g. the 8080 backend block). Always verify after certbot runs.
-- **Varnish + SKIP_CERTBOT** — if SSL skipped, exec_varnish writes HTTP-only config. Run certbot manually and then re-run exec_varnish or manually write the SSL 443 block.
+- **`certbot --nginx` (installer) injects SSL into the first matching server block** — possibly the 8080 backend. autopilot now uses `certonly --nginx`, which never edits vhosts; the gotcha only applies to manual `certbot --nginx` runs.
+- **Never pipe `nginx -t` into `grep` in a condition** — the script runs with `set -o pipefail`, so the pipeline fails whenever nginx fails, even if grep matched. Use `nginx_test` (captures output in `$NGINX_TEST_OUTPUT`, returns nginx's status).
+- **Varnish + SKIP_CERTBOT** — if SSL skipped, exec_varnish writes HTTP-only config. Later: `autopilot --resume-ssl <domain>` issues the cert; then write the SSL 443 front door (or re-run the launcher).
 - **wp-config.php proxy headers** — Varnish setup injects `HTTP_X_FORWARDED_PROTO` and `HTTP_X_FORWARDED_HOST` handling into wp-config.php automatically.
 - **MySQL admin auth** — root connects via socket by default (no password). Set MYSQL_ADMIN_PASS env if socket auth not available.
 - **PHP-FPM socket** — autopilot auto-detects first available socket if php8.3-fpm.sock missing.
